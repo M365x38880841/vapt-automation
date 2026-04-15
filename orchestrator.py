@@ -21,6 +21,7 @@ import datetime
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -222,8 +223,9 @@ def load_config(config_path: str) -> dict:
                 continue
             if "=" in line:
                 k, _, v = line.partition("=")
-                # Strip inline comments
-                v = v.split("#")[0].strip().strip('"').strip("'")
+                # Strip inline comments — only strip when # is preceded by whitespace,
+                # so URLs containing # (e.g. Slack webhooks) are preserved.
+                v = re.sub(r'\s+#.*$', '', v).strip().strip('"').strip("'")
                 config[k.strip()] = v
     return config
 

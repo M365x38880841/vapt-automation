@@ -17,6 +17,7 @@ check_testing_window
 # ─── RUNTIME REQUIREMENTS ────────────────────────────────────────────────────
 require_var "DOMAIN_NAME"; require_var "DC_IP"; require_var "TARGET_SUBNETS"
 require_var "ATTACKER_INTERFACE"; require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+detect_cme
 
 OUT_NET="$(phase_dir phase1 network)"
 OUT_AD="$(phase_dir phase1 ad)"
@@ -80,7 +81,7 @@ if ! skip_if_exists "${SMB_OUT}" "CrackMapExec SMB sweep"; then
     bg_run "cmexec_smb_sweep" \
         "${OUT_AD}/smb_sweep.log" \
         bash -c "for subnet in ${TARGET_SUBNETS}; do \
-            ${CME_BIN:-crackmapexec} smb \"\${subnet}\" \
+            ${CME_BIN} smb \"\${subnet}\" \
                 -u '${DOMAIN_USER}' -p '${DOMAIN_PASS}' \
                 2>&1; \
         done > '${SMB_OUT}'"
@@ -120,7 +121,7 @@ fi
 # ─── STEP 1.6 — SMB NULL SESSION CHECK (active — instant) ───────────────────
 log INFO "Checking for SMB null session (should be blocked)..."
 log_cmd "${CME_BIN} smb ${DC_IP} --null-session"
-"${CME_BIN:-crackmapexec}" smb "${DC_IP}" --null-session \
+"${CME_BIN}" smb "${DC_IP}" --null-session \
     2>&1 > "${OUT_AD}/nullsession_check.txt" || true
 if grep -q 'STATUS_ACCESS_DENIED\|STATUS_LOGON_FAILURE' "${OUT_AD}/nullsession_check.txt" 2>/dev/null; then
     log OK "Null session blocked (expected)"
@@ -149,17 +150,30 @@ else
     log INFO "BloodHound ZIP already exists: ${BH_ZIP} — skipping collection"
 fi
 
-# ─── STEP 1.8 — ROADRECON ENTRA ID GATHER (background) ───────────────────────
+# ─── STEP 1.8 — ROADRECON ENTRA ID GATHER ────────────────────────────────────
 ROAD_DB="${OUT_CLOUD}/roadrecon.db"
 if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather"; then
     log INFO "Starting ROADrecon Entra ID gather..."
-    bg_run "roadrecon_gather" \
-        "${OUT_CLOUD}/roadrecon.log" \
+    if [[ "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]]; then
+        # Device code flow: modern tenants with MFA/CA — runs in foreground (interactive)
+        log WARN "ROADrecon device code auth requires interactive input — running in foreground."
+        log WARN "Complete the browser authentication when prompted, then the script will continue."
         "${ROADRECON_BIN:-roadrecon}" gather \
-            -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
-            -p "${DOMAIN_PASS}" \
-            --database "${ROAD_DB}"
-    log INFO "ROADrecon running in background."
+            --device-code \
+            --database "${ROAD_DB}" \
+            2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
+        log OK "ROADrecon gather complete → ${ROAD_DB}"
+    else
+        # Legacy password auth — works only on tenants without MFA enforcement.
+        # If this fails silently with an empty DB, set ROADRECON_AUTH_METHOD=devicecode in config.env
+        bg_run "roadrecon_gather" \
+            "${OUT_CLOUD}/roadrecon.log" \
+            "${ROADRECON_BIN:-roadrecon}" gather \
+                -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
+                -p "${DOMAIN_PASS}" \
+                --database "${ROAD_DB}"
+        log INFO "ROADrecon running in background. If DB is empty after completion, set ROADRECON_AUTH_METHOD=devicecode."
+    fi
 fi
 
 # ─── STEP 1.9 — AZURE RESOURCE INVENTORY (background) ────────────────────────
@@ -169,24 +183,34 @@ if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory"; then
     bg_run "azure_inventory" \
         "${OUT_CLOUD}/azure_inventory.log" \
         bash -c "
-            all_resources=()
+            set -euo pipefail
+            # Collect resources per subscription into separate files, then merge.
+            # Using >> inside the loop would concatenate raw JSON arrays (invalid JSON).
             for sub in ${AZURE_SUBSCRIPTION_IDS}; do
-                az account set --subscription \"\${sub}\" 2>/dev/null
-                az resource list --output json 2>/dev/null
-            done > '${AZURE_INV}'
-            az vm list --output table            > '${OUT_CLOUD}/vms.txt'        2>&1
-            az storage account list --output table > '${OUT_CLOUD}/storage.txt'  2>&1
-            az network nsg list --output table   > '${OUT_CLOUD}/nsgs.txt'       2>&1
-            az keyvault list --output table      > '${OUT_CLOUD}/keyvaults.txt'  2>&1
-            az sql server list --output table    > '${OUT_CLOUD}/sql_servers.txt' 2>&1
-            az network public-ip list --output table > '${OUT_CLOUD}/public_ips.txt' 2>&1
-            az ad user list --output table       > '${OUT_CLOUD}/entra_users.txt' 2>&1
-            az ad group list --output table      > '${OUT_CLOUD}/entra_groups.txt' 2>&1
-            az ad app list --output table        > '${OUT_CLOUD}/entra_apps.txt'  2>&1
-            az ad sp list --output table         > '${OUT_CLOUD}/entra_sps.txt'   2>&1
-            az role assignment list --all --output table > '${OUT_CLOUD}/role_assignments.txt' 2>&1
+                az account set --subscription \"\${sub}\" 2>/dev/null || continue
+                az resource list --output json 2>/dev/null \
+                    > '${OUT_CLOUD}/inventory_'\"\${sub}\".json || true
+            done
+            # Merge per-subscription JSON arrays into one (requires jq)
+            if command -v jq &>/dev/null; then
+                jq -s 'add // []' '${OUT_CLOUD}'/inventory_*.json > '${AZURE_INV}' 2>/dev/null || true
+            else
+                cat '${OUT_CLOUD}'/inventory_*.json > '${AZURE_INV}' 2>/dev/null || true
+            fi
+            # Always enumerate against the last active subscription context for tenant-wide resources
+            az vm list --output table                    > '${OUT_CLOUD}/vms.txt'              2>&1 || true
+            az storage account list --output table       > '${OUT_CLOUD}/storage.txt'          2>&1 || true
+            az network nsg list --output table           > '${OUT_CLOUD}/nsgs.txt'             2>&1 || true
+            az keyvault list --output table              > '${OUT_CLOUD}/keyvaults.txt'        2>&1 || true
+            az sql server list --output table            > '${OUT_CLOUD}/sql_servers.txt'      2>&1 || true
+            az network public-ip list --output table     > '${OUT_CLOUD}/public_ips.txt'       2>&1 || true
+            az ad user list --output table               > '${OUT_CLOUD}/entra_users.txt'      2>&1 || true
+            az ad group list --output table              > '${OUT_CLOUD}/entra_groups.txt'     2>&1 || true
+            az ad app list --output table                > '${OUT_CLOUD}/entra_apps.txt'       2>&1 || true
+            az ad sp list --output table                 > '${OUT_CLOUD}/entra_sps.txt'        2>&1 || true
+            az role assignment list --all --output table > '${OUT_CLOUD}/role_assignments.txt' 2>&1 || true
         "
-    log INFO "Azure inventory running in background."
+    log INFO "Azure inventory running in background (one JSON file per subscription → merged into azure_inventory.json)."
 fi
 
 # ─── CHECK CRITICAL SMB SIGNING FINDING ──────────────────────────────────────

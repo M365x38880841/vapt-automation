@@ -35,6 +35,20 @@ PTH_COUNT=$(wc -l < "${OUTPUT_BASE_DIR}/phase3/ad/pth_accessible_hosts.txt" 2>/d
 PUBLIC_BLOBS=$(grep -c 'CRITICAL' "${EVIDENCE_DIR}/cloud/public_blob_poc.txt" 2>/dev/null || echo 0)
 UNCON_DELEG=$(grep -c 'sAMAccountName' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/unconstrained_delegation.txt" 2>/dev/null || echo 0)
 PNE_COUNT=$(grep -c 'sAMAccountName' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/pwd_never_expires.txt" 2>/dev/null || echo 0)
+ADCS_HITS=$(grep -c 'ESC[0-9]\|Enabled.*True' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/adcs/adcs_find.txt" 2>/dev/null || echo 0)
+SMB_VULN_HITS=$(grep -ci 'vulnerable' "${OUTPUT_BASE_DIR}/phase2/network/smb_vuln_checks.txt" 2>/dev/null || echo 0)
+
+# Copy AD CS and SMB vuln evidence
+cp -u "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/adcs/"* "${EVIDENCE_DIR}/ad/" 2>/dev/null && log OK "AD CS certipy output copied" || true
+cp -u "${OUTPUT_BASE_DIR}/phase2/network/smb_vuln_checks.txt" "${EVIDENCE_DIR}/network/" 2>/dev/null || true
+# ZAP DAST reports — one subdirectory per scanned target
+if [[ -d "${OUTPUT_BASE_DIR}/phase2/web/zap" ]]; then
+    cp -ur "${OUTPUT_BASE_DIR}/phase2/web/zap" "${EVIDENCE_DIR}/web/" 2>/dev/null && log OK "ZAP DAST reports copied" || true
+fi
+ZAP_TARGET_COUNT=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.html' 2>/dev/null | wc -l || echo 0)
+ZAP_HIGH_ALERTS=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.json' \
+    -exec python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sum(len(s.get('alerts',[])) for s in d.get('site',[]) if s.get('alerts')))" {} \; 2>/dev/null \
+    | awk '{s+=$1} END{print s+0}')
 
 # ─── GENERATE REPORT SCAFFOLD ─────────────────────────────────────────────────
 SCAFFOLD="${REPORT_DIR}/TECHNICAL_REPORT_SCAFFOLD.md"
@@ -64,6 +78,10 @@ cat > "${SCAFFOLD}" <<SCAFFOLD_EOF
 | Public Azure storage blobs | ${PUBLIC_BLOBS} | evidence/cloud/public_blob_poc.txt |
 | Unconstrained delegation hosts | ${UNCON_DELEG} | phase2/ad/ad_checks/unconstrained_delegation.txt |
 | Password never expires accounts | ${PNE_COUNT} | phase2/ad/ad_checks/pwd_never_expires.txt |
+| AD CS misconfigurations (ESC) | ${ADCS_HITS} | evidence/ad/adcs_find.txt |
+| SMB vulnerability hits | ${SMB_VULN_HITS} | evidence/network/smb_vuln_checks.txt |
+| Web targets DAST-scanned | ${ZAP_TARGET_COUNT} | evidence/web/zap/<target>/zap_report.html |
+| ZAP total alert count | ${ZAP_HIGH_ALERTS} | evidence/web/zap/<target>/zap_report.json |
 
 ---
 
@@ -124,26 +142,27 @@ cat > "${SCAFFOLD}" <<SCAFFOLD_EOF
 ---
 
 $(for i in $(seq 3 20); do
-echo "### Finding 0${i} — [TITLE — COMPLETE MANUALLY]"
-echo "**Severity:** "
-echo "**CVSS 3.1 Score:** "
-echo "**MITRE ATT&CK:** "
-echo "**Affected Asset(s):** "
-echo ""
-echo "**Evidence:**"
-echo "\`\`\`"
-echo "[Reference evidence file]"
-echo "\`\`\`"
-echo ""
-echo "**Business Impact:** > [COMPLETE MANUALLY]"
-echo ""
-echo "**Remediation Steps:** > [COMPLETE MANUALLY]"
-echo ""
-echo "**Owner:** "
-echo "**References:** "
-echo ""
-echo "---"
-echo ""
+    num=$(printf "%03d" "$i")
+    echo "### Finding ${num} — [TITLE — COMPLETE MANUALLY]"
+    echo "**Severity:** "
+    echo "**CVSS 3.1 Score:** "
+    echo "**MITRE ATT&CK:** "
+    echo "**Affected Asset(s):** "
+    echo ""
+    echo "**Evidence:**"
+    echo "\`\`\`"
+    echo "[Reference evidence file]"
+    echo "\`\`\`"
+    echo ""
+    echo "**Business Impact:** > [COMPLETE MANUALLY]"
+    echo ""
+    echo "**Remediation Steps:** > [COMPLETE MANUALLY]"
+    echo ""
+    echo "**Owner:** "
+    echo "**References:** "
+    echo ""
+    echo "---"
+    echo ""
 done)
 
 ## MITRE ATT&CK Coverage Matrix

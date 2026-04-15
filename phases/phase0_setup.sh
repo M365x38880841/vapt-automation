@@ -3,7 +3,7 @@
 # phases/phase0_setup.sh — Pre-Engagement Setup
 # ============================================================================
 # AUTOMATED: tool verification, directory scaffolding, config validation,
-#            wordlist check, Azure CLI login check.
+#            wordlist check, Azure CLI login check, BloodHound CE startup.
 # MANUAL:    RoE sign-off, asset inventory handover, stakeholder comms.
 # ============================================================================
 set -euo pipefail
@@ -12,6 +12,116 @@ source "${SCRIPT_DIR}/../lib/common.sh"
 
 log PHASE "Phase 0 — Pre-Engagement Setup"
 check_testing_window
+
+# ─── PIPX BOOTSTRAP ──────────────────────────────────────────────────────────
+# pipx must be available BEFORE any pip_install() call. It installs each Python
+# pentest tool into its own isolated venv and exposes the binary globally on PATH —
+# no venv activation needed, no PEP 668 errors, no system Python conflicts.
+log INFO "Bootstrapping pipx..."
+if ! command -v pipx &>/dev/null; then
+    sudo apt-get install -y pipx 2>/dev/null \
+        || pip3 install pipx --break-system-packages 2>/dev/null \
+        || pip3 install pipx 2>/dev/null \
+        || { log ERROR "Could not install pipx. Falling back to pip3 --break-system-packages for all installs."; }
+fi
+if command -v pipx &>/dev/null; then
+    pipx ensurepath 2>/dev/null || true
+    # Ensure ~/.local/bin is on PATH for this session (ensurepath only updates .bashrc)
+    export PATH="${HOME}/.local/bin:${PATH}"
+    log OK "pipx ready: $(command -v pipx)"
+fi
+
+# ─── DOCKER SETUP ────────────────────────────────────────────────────────────
+# Handles all three real-world states on Kali:
+#   1. Docker fully working (skip everything)
+#   2. Docker binary present but daemon not running (start it; check for compose plugin)
+#   3. Docker absent / broken (full Docker CE install with GPG key + repo)
+#
+# Uses Docker CE from upstream (download.docker.com/linux/debian), NOT docker.io.
+# docker.io is the outdated Ubuntu/Debian community build — it often lacks the
+# compose plugin and lags behind on security fixes on Kali.
+ensure_docker() {
+    local docker_ok=false
+
+    # ── State 1: Already installed and daemon is reachable ──────────────────
+    if command -v docker &>/dev/null; then
+        if docker info &>/dev/null 2>&1 || sudo docker info &>/dev/null 2>&1; then
+            docker_ok=true
+        else
+            # ── State 2: Binary present but daemon not running ───────────────
+            log WARN "Docker binary found but daemon not running. Attempting to start..."
+            sudo systemctl start docker 2>/dev/null \
+                || sudo service docker start 2>/dev/null \
+                || true
+            sleep 3
+            if docker info &>/dev/null 2>&1 || sudo docker info &>/dev/null 2>&1; then
+                docker_ok=true
+                log OK "Docker daemon started"
+            else
+                log WARN "Daemon did not start — will reinstall Docker CE"
+            fi
+        fi
+    fi
+
+    # ── State 3: Full Docker CE installation on Kali ────────────────────────
+    if ! $docker_ok; then
+        log INFO "Installing Docker CE (upstream) on Kali Linux..."
+
+        # Remove conflicting/outdated packages (docker.io is replaced by docker-ce)
+        sudo apt-get remove -y docker docker.io containerd runc docker-compose 2>/dev/null || true
+
+        # Add Docker's official GPG key (only if not already present)
+        sudo install -m 0755 -d /etc/apt/keyrings
+        if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+            curl -fsSL https://download.docker.com/linux/debian/gpg \
+                | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            sudo chmod a+r /etc/apt/keyrings/docker.gpg
+            log OK "Docker GPG key added → /etc/apt/keyrings/docker.gpg"
+        fi
+
+        # Add Docker CE repository — Kali is Debian-based, use bookworm codename
+        if [[ ! -f /etc/apt/sources.list.d/docker.list ]]; then
+            local arch; arch=$(dpkg --print-architecture)
+            echo \
+              "deb [arch=${arch} signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/debian bookworm stable" \
+                | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            log OK "Docker CE apt repo added (/etc/apt/sources.list.d/docker.list)"
+        fi
+
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+            docker-ce docker-ce-cli containerd.io \
+            docker-buildx-plugin docker-compose-plugin
+
+        sudo systemctl enable docker 2>/dev/null || true
+        sudo systemctl start docker 2>/dev/null \
+            || sudo service docker start 2>/dev/null \
+            || log WARN "Docker daemon did not start automatically. Run: sudo service docker start"
+
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        log OK "Docker CE installed. Run 'newgrp docker' or re-login to use docker without sudo."
+        docker_ok=true
+    fi
+
+    # ── Compose plugin check (independent of whether we just installed Docker) ─
+    # docker compose (v2 plugin) is required; docker-compose (v1 binary) is not enough.
+    if ! docker compose version &>/dev/null 2>&1; then
+        log WARN "docker compose plugin (v2) missing — installing now"
+        sudo apt-get install -y docker-compose-plugin 2>/dev/null \
+            || log ERROR "Could not install docker-compose-plugin. Run: sudo apt-get install docker-compose-plugin"
+    else
+        log OK "docker compose plugin: $(docker compose version --short 2>/dev/null || echo 'ok')"
+    fi
+
+    # ── Add user to docker group if not already a member ────────────────────
+    if ! groups "$USER" 2>/dev/null | grep -q '\bdocker\b'; then
+        sudo usermod -aG docker "$USER" 2>/dev/null || true
+        log WARN "User '${USER}' added to docker group. Run 'newgrp docker' for passwordless docker in this session."
+    fi
+}
+
+ensure_docker
 
 # ─── CREATE EVIDENCE DIRECTORY STRUCTURE ─────────────────────────────────────
 log INFO "Creating engagement directory structure under: ${OUTPUT_BASE_DIR}"
@@ -25,8 +135,13 @@ log OK "Directory structure created"
 
 # ─── TOOL VERIFICATION ───────────────────────────────────────────────────────
 log INFO "Verifying required tools..."
-TOOLS_REQUIRED=(nmap crackmapexec responder hashcat bloodhound-python roadrecon scout az docker)
-TOOLS_OPTIONAL=(impacket-GetUserSPNs impacket-GetNPUsers impacket-ntlmrelayx impacket-secretsdump impacket-psexec msfconsole)
+
+# Auto-detect nxc (Kali 2024+) vs crackmapexec (older Kali) before the check loop
+detect_cme
+log INFO "CME binary resolved to: ${CME_BIN}"
+
+TOOLS_REQUIRED=(nmap "${CME_BIN}" responder hashcat bloodhound-python roadrecon az docker ldapsearch)
+TOOLS_OPTIONAL=(impacket-GetUserSPNs impacket-GetNPUsers impacket-ntlmrelayx impacket-secretsdump impacket-psexec certipy-ad msfconsole)
 MISSING_REQUIRED=(); MISSING_OPTIONAL=()
 
 for tool in "${TOOLS_REQUIRED[@]}"; do
@@ -47,41 +162,105 @@ for tool in "${TOOLS_OPTIONAL[@]}"; do
     fi
 done
 
-# Auto-install missing required tools
+# ─── AUTO-INSTALL MISSING REQUIRED TOOLS ─────────────────────────────────────
 if [[ ${#MISSING_REQUIRED[@]} -gt 0 ]]; then
     log WARN "Missing required tools: ${MISSING_REQUIRED[*]}"
     checkpoint "Auto-install missing required tools via apt/pip?"
     sudo apt-get update -qq
     for tool in "${MISSING_REQUIRED[@]}"; do
         case "$tool" in
-            nmap)              sudo apt-get install -y nmap ;;
-            crackmapexec)      pip3 install crackmapexec --quiet ;;
-            responder)         sudo apt-get install -y responder ;;
-            hashcat)           sudo apt-get install -y hashcat ;;
-            bloodhound-python) pip3 install bloodhound --quiet ;;
-            roadrecon)         pip3 install roadrecon --quiet ;;
-            scout)             pip3 install scoutsuite --quiet ;;
-            az)                curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash ;;
-            docker)            sudo apt-get install -y docker.io && sudo systemctl start docker ;;
-            *)                 log WARN "Don't know how to auto-install: ${tool}" ;;
+            nmap)
+                sudo apt-get install -y nmap ;;
+            crackmapexec|nxc)
+                # Prefer nxc (NetExec) — the maintained successor to CrackMapExec
+                if sudo apt-get install -y netexec 2>/dev/null; then
+                    log OK "netexec (nxc) installed via apt"
+                elif sudo apt-get install -y crackmapexec 2>/dev/null; then
+                    log OK "crackmapexec installed via apt"
+                else
+                    pip_install netexec || pip_install crackmapexec
+                fi
+                # Re-detect after install
+                detect_cme
+                ;;
+            responder)
+                sudo apt-get install -y responder ;;
+            hashcat)
+                sudo apt-get install -y hashcat ;;
+            bloodhound-python)
+                pip_install bloodhound || { log ERROR "Failed to install bloodhound-python"; exit 1; } ;;
+            roadrecon)
+                pip_install roadrecon || { log ERROR "Failed to install roadrecon"; exit 1; } ;;
+            az)
+                # Prefer apt over curl-pipe-to-bash for auditability and reliability
+                if apt-cache show azure-cli &>/dev/null 2>&1; then
+                    sudo apt-get install -y azure-cli
+                else
+                    log WARN "azure-cli not in apt sources — installing via Microsoft script"
+                    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+                fi
+                ;;
+            docker)
+                # Docker is handled by ensure_docker() at the top of this script.
+                # This case should never be reached since ensure_docker runs unconditionally,
+                # but it is kept here as a safety net if TOOLS_REQUIRED checking re-adds it.
+                ensure_docker
+                ;;
+            ldapsearch)
+                sudo apt-get install -y ldap-utils ;;
+            *)
+                log WARN "Don't know how to auto-install: ${tool}" ;;
         esac
     done
 fi
 
+# ─── AUTO-INSTALL OPTIONAL TOOLS ─────────────────────────────────────────────
 if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
-    log WARN "Optional Impacket tools missing. Installing..."
-    pip3 install impacket --quiet && log OK "Impacket suite installed"
+    log WARN "Missing optional tools: ${MISSING_OPTIONAL[*]}"
+    checkpoint "Auto-install missing optional tools (Impacket suite + certipy-ad)?"
+    for tool in "${MISSING_OPTIONAL[@]}"; do
+        case "$tool" in
+            impacket-*)
+                pip_install impacket && log OK "Impacket suite installed" || \
+                    log WARN "Impacket install failed — try: pip3 install impacket --break-system-packages"
+                break  # installing impacket covers all impacket-* tools
+                ;;
+            certipy-ad)
+                pip_install certipy-ad && log OK "certipy-ad installed" || \
+                    log WARN "certipy-ad install failed — AD CS checks in Phase 2 will be skipped"
+                ;;
+            msfconsole)
+                log WARN "Metasploit (msfconsole) not auto-installed — install via: sudo apt-get install metasploit-framework"
+                ;;
+        esac
+    done
+fi
+
+# ─── VERIFY SCOUTSUITE INVOCATION ─────────────────────────────────────────────
+log INFO "Checking ScoutSuite invocation..."
+if ! pip_install scoutsuite 2>/dev/null; then
+    log WARN "ScoutSuite install failed — Phase 2 cloud audit will be skipped"
+fi
+# Validate the correct "scout suite" invocation (not bare "scout")
+set_scout_cmd
+if "${SCOUT_CMD_ARRAY[@]}" --help &>/dev/null 2>&1; then
+    log OK "ScoutSuite invocation confirmed: ${SCOUT_CMD_ARRAY[*]}"
+else
+    log WARN "ScoutSuite invocation '${SCOUT_CMD_ARRAY[*]}' not responding — Phase 2 cloud audit may fail"
 fi
 
 # ─── WORDLIST CHECK ───────────────────────────────────────────────────────────
 log INFO "Checking wordlists..."
 if [[ ! -f "${WORDLIST_PRIMARY}" ]]; then
     log WARN "Primary wordlist not found: ${WORDLIST_PRIMARY}"
-    checkpoint "Download rockyou.txt wordlist (~60MB)?"
+    checkpoint "Prepare rockyou.txt wordlist (~60MB)?"
     mkdir -p "$(dirname "${WORDLIST_PRIMARY}")"
     if [[ -f /usr/share/wordlists/rockyou.txt.gz ]]; then
         sudo gunzip /usr/share/wordlists/rockyou.txt.gz
         log OK "rockyou.txt decompressed"
+    elif sudo apt-get install -y wordlists &>/dev/null 2>&1 && [[ -f /usr/share/wordlists/rockyou.txt.gz ]]; then
+        sudo gunzip /usr/share/wordlists/rockyou.txt.gz
+        log OK "rockyou.txt installed via apt wordlists package"
     else
         sudo wget -q -O "${WORDLIST_PRIMARY}.gz" \
             https://github.com/praetorian-inc/Hob0Rules/raw/master/wordlists/rockyou.txt.gz
@@ -115,13 +294,35 @@ if [[ ! -f "${CORP_WORDLIST}" ]]; then
 fi
 export WORDLIST_CORPORATE="${CORP_WORDLIST}"
 
-# ─── BLOODHOUND CE CHECK ──────────────────────────────────────────────────────
-log INFO "Checking BloodHound CE Docker image..."
-if docker image inspect specterops/bloodhound:latest &>/dev/null; then
-    log OK "BloodHound CE image available"
+# ─── BLOODHOUND CE — DOCKER COMPOSE STACK ────────────────────────────────────
+BHCE_DIR="${SCRIPT_DIR}/../tools/bloodhound-ce"
+BHCE_COMPOSE="${BHCE_DIR}/docker-compose.yml"
+BHCE_CONFIG="${BHCE_DIR}/bloodhound.config.json"
+
+log INFO "Checking BloodHound CE Docker stack..."
+# ensure_docker() already ran above — Docker is available at this point.
+if [[ ! -f "${BHCE_CONFIG}" ]]; then
+    log ERROR "BloodHound CE config not found: ${BHCE_CONFIG}"
+    log ERROR "Ensure tools/bloodhound-ce/bloodhound.config.json is present in the repo."
+    exit 1
+fi
+
+# Check if stack is already running (covers both fresh start and resume after reboot)
+if docker compose -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy'; then
+    log OK "BloodHound CE stack already running → http://localhost:8080"
 else
-    log INFO "Pulling BloodHound CE image..."
-    docker pull specterops/bloodhound:latest && log OK "BloodHound CE pulled"
+    checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"
+    log INFO "Pulling and starting BloodHound CE stack (first run downloads ~1.5 GB, may take 3–5 min)..."
+    docker compose -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
+    log INFO "Waiting for BloodHound CE health checks (up to 90s)..."
+    local_wait=0
+    until docker compose -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'healthy|running' \
+          || [[ $local_wait -ge 90 ]]; do
+        sleep 5; (( local_wait += 5 ))
+    done
+    log OK "BloodHound CE stack started → http://localhost:8080"
+    log INFO "Get first-run admin password:"
+    log INFO "  docker compose -f ${BHCE_COMPOSE} logs bloodhound 2>&1 | grep -i 'initial password\|password'"
 fi
 
 # ─── AZURE CLI LOGIN CHECK ────────────────────────────────────────────────────
@@ -171,5 +372,6 @@ echo -e "    • Signed RoE from all 6 parties"
 echo -e "    • Asset inventory from Networking + Cloud Platform teams"
 echo -e "    • Confirm testing window with Management Sponsors"
 echo -e "    • Emergency stop contact confirmed"
+echo -e "    • BloodHound CE first-run password → docker compose -f tools/bloodhound-ce/docker-compose.yml logs bloodhound | grep -i password"
 echo ""
 log OK "Phase 0 automated setup complete"

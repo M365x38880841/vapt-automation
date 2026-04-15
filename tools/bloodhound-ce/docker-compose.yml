@@ -1,0 +1,61 @@
+# ============================================================================
+# BloodHound Community Edition — Docker Compose stack
+# Usage: docker compose up -d
+# Web UI: http://localhost:8080  (default creds: admin / [generated on first run])
+# ============================================================================
+version: '3'
+
+services:
+  bloodhound:
+    image: specterops/bloodhound:latest
+    environment:
+      - bloodhound_config_path=/bloodhound.config.json
+    volumes:
+      - ./bloodhound.config.json:/bloodhound.config.json:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      app-db:
+        condition: service_healthy
+      graph-db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  app-db:
+    image: docker.io/library/postgres:13.2
+    environment:
+      POSTGRES_USER: bloodhound
+      POSTGRES_PASSWORD: bloodhoundcommunityedition
+      POSTGRES_DATABASE: bloodhound
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bloodhound"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  graph-db:
+    image: docker.io/library/neo4j:4.4
+    environment:
+      NEO4J_AUTH: neo4j/bloodhoundcommunityedition
+      NEO4J_dbms_allow__upgrade: "true"
+    ports:
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  neo4j-data:

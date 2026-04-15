@@ -3,11 +3,13 @@
 # phases/phase2_va.sh — Vulnerability Assessment
 # ============================================================================
 # AUTOMATED (background): ScoutSuite Azure audit, Azure CLI security checks
-#                         (NSGs, storage, KV, role assignments, public IPs).
-# AUTOMATED (active):     PingCastle remote invocation (if Windows runner
-#                         configured), Nessus API-triggered scan.
-# MANUAL (after script):  Nessus/OpenVAS UI config, Burp Suite web testing,
-#                         Purple Knight (Windows-only), report review.
+#                         (NSGs, storage, KV, role assignments, public IPs),
+#                         OWASP ZAP DAST web scan (baseline or full-scan mode).
+# AUTOMATED (active):     AD CS certipy ESC checks, SMB vuln modules (ms17-010,
+#                         nopac, petitpotam), Nessus API trigger.
+# MANUAL (after script):  Nessus/OpenVAS UI config, Burp Suite manual testing
+#                         (auth/IDOR/session/injection), Purple Knight (Windows),
+#                         PingCastle (Windows), report review.
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,6 +20,8 @@ check_testing_window
 
 require_var "DOMAIN_NAME"; require_var "DC_IP"; require_var "AZURE_TENANT_ID"
 require_var "AZURE_SUBSCRIPTION_IDS"; require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+detect_cme
+set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
 
 OUT_AD="${OUTPUT_BASE_DIR}/phase2/ad"
 OUT_CLOUD="${OUTPUT_BASE_DIR}/phase2/cloud"
@@ -28,23 +32,28 @@ mkdir -p "${OUT_AD}" "${OUT_CLOUD}" "${OUT_WEB}" "${OUT_NET}"
 LIVE_HOSTS="${OUTPUT_BASE_DIR}/phase1/network/live_hosts_all.txt"
 require_file "${LIVE_HOSTS}"
 
-# ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background — 25–45 min) ──────────────
+# ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background — one job per subscription) ─
+# Runs against ALL subscriptions, not just the first one.
 SCOUT_REPORT_DIR="${OUT_CLOUD}/scoutsuite"
 mkdir -p "${SCOUT_REPORT_DIR}"
-SCOUT_DONE="${SCOUT_REPORT_DIR}/report.html"
 
-if ! skip_if_exists "${SCOUT_DONE}" "ScoutSuite Azure audit"; then
-    checkpoint "Launch ScoutSuite audit against Azure tenant ${AZURE_TENANT_ID}?"
-    log INFO "Starting ScoutSuite in background (est. 25–45 min)..."
-    bg_run "scoutsuite_audit" \
-        "${OUT_CLOUD}/scoutsuite.log" \
-        "${SCOUT_BIN:-scout}" azure \
-            --tenant "${AZURE_TENANT_ID}" \
-            --subscription-id "${AZURE_SUBSCRIPTION_IDS%% *}" \
-            --report-dir "${SCOUT_REPORT_DIR}" \
-            --no-browser
-    log INFO "ScoutSuite running in background. PID: ${BG_JOB_PIDS[-1]}"
-fi
+for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
+    SCOUT_REPORT_SUB="${SCOUT_REPORT_DIR}/${sub_id}"
+    SCOUT_DONE_SUB="${SCOUT_REPORT_SUB}/report.html"
+    mkdir -p "${SCOUT_REPORT_SUB}"
+    if ! skip_if_exists "${SCOUT_DONE_SUB}" "ScoutSuite audit for subscription ${sub_id}"; then
+        checkpoint "Launch ScoutSuite audit against subscription ${sub_id} (tenant: ${AZURE_TENANT_ID})?"
+        log INFO "Starting ScoutSuite for ${sub_id} in background (est. 25–45 min)..."
+        bg_run "scoutsuite_${sub_id}" \
+            "${OUT_CLOUD}/scoutsuite_${sub_id}.log" \
+            "${SCOUT_CMD_ARRAY[@]}" azure \
+                --tenant "${AZURE_TENANT_ID}" \
+                --subscription-id "${sub_id}" \
+                --report-dir "${SCOUT_REPORT_SUB}" \
+                --no-browser
+        log INFO "ScoutSuite (${sub_id}) PID: ${BG_JOB_PIDS[-1]}"
+    fi
+done
 
 # ─── STEP 2.2 — AZURE SECURITY CHECKS (background — parallel set) ────────────
 AZ_SEC="${OUT_CLOUD}/security_checks"
@@ -149,7 +158,7 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks"; t
     # Password policy check
     log INFO "Extracting domain password policy..."
     log_cmd "${CME_BIN} smb ${DC_IP} -u ... --pass-pol"
-    "${CME_BIN:-crackmapexec}" smb "${DC_IP}" \
+    "${CME_BIN}" smb "${DC_IP}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
         --pass-pol \
         2>&1 > "${AD_CHECKS}/password_policy.txt" || true
@@ -157,14 +166,14 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks"; t
 
     # Enumerate shares
     log INFO "Enumerating accessible shares..."
-    "${CME_BIN:-crackmapexec}" smb "${DC_IP}" \
+    "${CME_BIN}" smb "${DC_IP}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
         --shares \
         2>&1 > "${AD_CHECKS}/shares.txt" || true
 
     # Check for accounts with no pre-auth (AS-REP using CME)
     log INFO "Checking admin group members..."
-    "${CME_BIN:-crackmapexec}" smb "${DC_IP}" \
+    "${CME_BIN}" smb "${DC_IP}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
         --groups "Domain Admins" \
         2>&1 > "${AD_CHECKS}/domain_admins.txt" || true
@@ -197,11 +206,121 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks"; t
         log WARN "FINDING: ${PNE_COUNT} account(s) with 'password never expires'" || \
         log OK "No password-never-expires accounts found"
 
+    # ── AD Certificate Services (AD CS) vulnerability enumeration ──────────────
+    # Covers ESC1–ESC8: misconfigured certificate templates & CA permissions.
+    # This is one of the highest-value finding classes in modern internal VAPTs.
+    ADCS_OUT="${AD_CHECKS}/adcs"
+    mkdir -p "${ADCS_OUT}"
+    CERTIPY_CMD=$(command -v certipy-ad 2>/dev/null || command -v certipy 2>/dev/null || echo "")
+    if [[ -n "${CERTIPY_CMD}" ]]; then
+        if ! skip_if_exists "${ADCS_OUT}/adcs_find.txt" "AD CS ESC vulnerability scan"; then
+            log INFO "Running Certipy AD CS enumeration (ESC1–ESC8 checks)..."
+            log_cmd "${CERTIPY_CMD} find -u ${DOMAIN_USER}@${DOMAIN_NAME} -p *** -dc-ip ${DC_IP} -vulnerable"
+            "${CERTIPY_CMD}" find \
+                -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
+                -p "${DOMAIN_PASS}" \
+                -dc-ip "${DC_IP}" \
+                -vulnerable \
+                -output "${ADCS_OUT}/adcs" \
+                2>&1 | tee "${ADCS_OUT}/adcs_find.txt" || true
+            ADCS_VULN=$(grep -c 'ESC[0-9]\|Enabled.*True\|Client Authentication' "${ADCS_OUT}/adcs_find.txt" 2>/dev/null || echo 0)
+            [[ "${ADCS_VULN}" -gt 0 ]] && \
+                log WARN "FINDING: ${ADCS_VULN} potential AD CS misconfiguration(s) — review ${ADCS_OUT}/adcs_find.txt" || \
+                log OK "No obvious AD CS ESC misconfigurations detected"
+        fi
+    else
+        log WARN "certipy-ad not installed — AD CS enumeration skipped. Install: pip3 install certipy-ad --break-system-packages"
+    fi
+
+    # ── SMB vulnerability module checks (MS17-010, noPac, PetitPotam) ──────────
+    SMB_VULN_OUT="${OUT_NET}/smb_vuln_checks.txt"
+    if ! skip_if_exists "${SMB_VULN_OUT}" "SMB vulnerability module checks"; then
+        log INFO "Running SMB vulnerability checks (ms17-010, nopac, petitpotam)..."
+        > "${SMB_VULN_OUT}"
+        for module in ms17-010 nopac petitpotam; do
+            log_cmd "${CME_BIN} smb -iL ${LIVE_HOSTS} -M ${module}"
+            "${CME_BIN}" smb \
+                -iL "${LIVE_HOSTS}" \
+                -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
+                -M "${module}" \
+                2>&1 >> "${SMB_VULN_OUT}" || true
+        done
+        VULN_HITS=$(grep -ci 'vulnerable\|VULNERABLE' "${SMB_VULN_OUT}" 2>/dev/null || echo 0)
+        [[ "${VULN_HITS}" -gt 0 ]] && \
+            log WARN "FINDING: ${VULN_HITS} SMB vulnerability module hit(s) → ${SMB_VULN_OUT}" || \
+            log OK "No SMB vulnerability module hits detected"
+    fi
+
     touch "${AD_CHECKS}/done.flag"
     log OK "Linux AD checks complete → ${AD_CHECKS}/"
 fi
 
-# ─── STEP 2.4 — NESSUS API TRIGGER (if Nessus configured) ────────────────────
+# ─── STEP 2.4 — DAST: OWASP ZAP AUTOMATED WEB SCAN ──────────────────────────
+# Runs ZAP via Docker — no Java install required, no version conflicts on Kali.
+# Targets come from WEB_TARGETS in config.env (space-separated base URLs).
+# Scan modes:
+#   baseline — passive scan only: no attack payloads, safe, fast, good first pass.
+#   full      — active scan: sends attack payloads, confirm RoE explicitly covers this.
+ZAP_OUT="${OUT_WEB}/zap"
+mkdir -p "${ZAP_OUT}"
+
+if [[ -z "${WEB_TARGETS:-}" ]]; then
+    log WARN "WEB_TARGETS not set in config.env — DAST skipped. Set WEB_TARGETS to enable ZAP scans."
+else
+    if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
+        log WARN "Docker not available — OWASP ZAP DAST skipped (Docker required)"
+    else
+        # Pull ZAP image once (cached on subsequent runs)
+        ZAP_IMAGE="ghcr.io/zaproxy/zaproxy:stable"
+        if ! docker image inspect "${ZAP_IMAGE}" &>/dev/null 2>&1; then
+            log INFO "Pulling OWASP ZAP Docker image (one-time, ~200MB)..."
+            docker pull "${ZAP_IMAGE}" 2>&1 | tail -3
+        fi
+        log OK "ZAP image ready: ${ZAP_IMAGE}"
+
+        case "${ZAP_SCAN_MODE:-baseline}" in
+            full|active) ZAP_SCRIPT="zap-full-scan.py" ;;
+            *)            ZAP_SCRIPT="zap-baseline.py"  ;;
+        esac
+        log INFO "ZAP scan mode: ${ZAP_SCAN_MODE:-baseline} (script: ${ZAP_SCRIPT})"
+
+        for target in ${WEB_TARGETS}; do
+            # Sanitise target URL into a filesystem-safe name for output dirs
+            safe_name="${target//[^a-zA-Z0-9._-]/_}"
+            ZAP_TARGET_OUT="${ZAP_OUT}/${safe_name}"
+            mkdir -p "${ZAP_TARGET_OUT}"
+            ZAP_DONE="${ZAP_TARGET_OUT}/zap_report.html"
+
+            if skip_if_exists "${ZAP_DONE}" "ZAP ${ZAP_SCAN_MODE:-baseline} scan: ${target}"; then
+                continue
+            fi
+
+            checkpoint "Launch OWASP ZAP ${ZAP_SCAN_MODE:-baseline} scan against ${target}?"
+            log INFO "Starting ZAP background scan: ${target}"
+            log_cmd "docker run ... zaproxy ${ZAP_SCRIPT} -t ${target}"
+
+            # ZAP writes reports relative to /zap/wrk inside the container.
+            # --network host: allows ZAP to reach internal hosts on the LAN.
+            # -I: don't fail the container on warnings (non-zero exits still logged).
+            bg_run "zap_${safe_name}" \
+                "${ZAP_TARGET_OUT}/zap.log" \
+                docker run --rm \
+                    --network host \
+                    -v "${ZAP_TARGET_OUT}:/zap/wrk:rw" \
+                    "${ZAP_IMAGE}" \
+                    "${ZAP_SCRIPT}" \
+                        -t "${target}" \
+                        -r "zap_report.html" \
+                        -J "zap_report.json" \
+                        -x "zap_report.xml" \
+                        -I
+
+            log INFO "ZAP scanning ${target} in background → ${ZAP_DONE}"
+        done
+    fi
+fi
+
+# ─── STEP 2.5 — NESSUS API TRIGGER (if Nessus configured) ────────────────────
 if [[ -n "${NESSUS_URL:-}" && -n "${NESSUS_USER:-}" && -n "${NESSUS_PASS:-}" ]]; then
     log INFO "Triggering Nessus scan via API..."
     NESSUS_SCAN_OUT="${OUT_NET}/nessus_scan.json"
@@ -241,15 +360,19 @@ echo -e "${BOLD}${CYAN}═══════════════════
     echo -e "${RED}  Unconstrained delegation hosts: ${UNCON_COUNT:-?} (→ HIGH finding)${RESET}"
 [[ -f "${AD_CHECKS}/pwd_never_expires.txt" ]] && \
     echo -e "${YELLOW}  Password never expires: ${PNE_COUNT:-?} accounts${RESET}"
+[[ -f "${AD_CHECKS}/adcs/adcs_find.txt" ]] && \
+    echo -e "${RED}  AD CS ESC hits: ${ADCS_VULN:-?} (→ review certipy output for template abuse)${RESET}"
+[[ -f "${OUT_NET}/smb_vuln_checks.txt" ]] && \
+    echo -e "${RED}  SMB vuln module hits: ${VULN_HITS:-?} (→ ms17-010/nopac/petitpotam)${RESET}"
 
 status_bg_jobs
 echo ""
 echo -e "${YELLOW}  Manual steps still required:${RESET}"
 echo -e "    • Launch Nessus/OpenVAS credentialed scan via UI (start at EOD)"
-echo -e "    • Burp Suite: browse all in-scope web apps + run active scan"
-echo -e "    • Burp Suite: manual auth, IDOR, session, injection checks"
+echo -e "    • Burp Suite: manual auth, IDOR, session, injection checks (ZAP covers passive; Burp covers logic)"
+echo -e "    • ZAP reports (when bg jobs finish): ${ZAP_OUT}/<target>/zap_report.html"
 echo -e "    • PingCastle: run from a Windows domain-joined machine"
 echo -e "    • Purple Knight: run from Windows — collect PDF report"
-echo -e "    • Review ScoutSuite HTML report when background job completes"
+echo -e "    • Review ScoutSuite HTML reports when background jobs complete"
 echo ""
 log OK "Phase 2 automated components complete."

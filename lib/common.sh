@@ -9,6 +9,56 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 MAGENTA='\033[0;35m'
 
+# ─── PIP INSTALL HELPER ───────────────────────────────────────────────────────
+# Strategy: pipx FIRST — installs each tool in its own isolated venv and exposes
+# the binary globally on PATH. No venv activation required, no system package
+# conflicts, no PEP 668 errors (Kali 2023.1+).
+# pipx is bootstrapped in phase0_setup.sh before any pip_install call.
+# pip3 --break-system-packages is the fallback for packages that don't work well
+# under pipx (e.g. libraries rather than standalone tools).
+pip_install() {
+    local package="$1"
+    if command -v pipx &>/dev/null; then
+        # Install — if already present, upgrade instead (pipx install errors on duplicates)
+        if pipx install "${package}" 2>/dev/null \
+           || pipx upgrade "${package}" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    # pip3 fallback: handles PEP 668 (externally-managed-environment on Kali 2023.1+)
+    if pip3 install "${package}" --quiet --break-system-packages 2>/dev/null; then
+        return 0
+    fi
+    pip3 install "${package}" --quiet 2>/dev/null
+    return $?
+}
+
+# ─── SCOUTSUITE INVOCATION HELPER ─────────────────────────────────────────────
+# ScoutSuite's CLI is "scout suite" (two words), not "scout".
+# Sets global SCOUT_CMD_ARRAY for use as: "${SCOUT_CMD_ARRAY[@]}" azure ...
+set_scout_cmd() {
+    if command -v scout &>/dev/null; then
+        SCOUT_CMD_ARRAY=( scout suite )
+    elif python3 -c "import ScoutSuite" 2>/dev/null; then
+        SCOUT_CMD_ARRAY=( python3 -m ScoutSuite )
+    else
+        SCOUT_CMD_ARRAY=( scout suite )  # will fail with clear "not found" message
+    fi
+}
+
+# ─── CME/NXC BINARY DETECTION ─────────────────────────────────────────────────
+# CrackMapExec was renamed to NetExec (nxc) in Kali 2024+. Auto-detect.
+detect_cme() {
+    CME_BIN="${CME_BIN:-}"
+    if [[ -n "${CME_BIN}" ]] && command -v "${CME_BIN}" &>/dev/null; then
+        return 0
+    fi
+    CME_BIN=$(command -v nxc 2>/dev/null \
+        || command -v crackmapexec 2>/dev/null \
+        || echo "nxc")
+    export CME_BIN
+}
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 LOG_FILE="${OUTPUT_BASE_DIR:-$HOME/vapt}/engagement_log.md"
 
@@ -69,7 +119,13 @@ check_testing_window() {
     local current_time; current_time=$(date '+%H:%M')
     local start="${TESTING_WINDOW_START:-09:00}"
     local end="${TESTING_WINDOW_END:-17:00}"
-    if [[ "$current_time" < "$start" ]] || [[ "$current_time" > "$end" ]]; then
+    # Convert HH:MM to minutes-since-midnight for reliable numeric comparison
+    _hm_to_min() { local h m; IFS=: read -r h m <<< "$1"; echo $(( 10#$h * 60 + 10#$m )); }
+    local cur_min start_min end_min
+    cur_min=$(_hm_to_min "${current_time}")
+    start_min=$(_hm_to_min "${start}")
+    end_min=$(_hm_to_min "${end}")
+    if (( cur_min < start_min || cur_min > end_min )); then
         echo -e "${RED}[SAFETY] Current time ${current_time} is outside testing window (${start}–${end}).${RESET}"
         echo -e "${YELLOW}Override? This may violate the Rules of Engagement. [y/N]:${RESET} \c"
         read -r override
@@ -202,7 +258,19 @@ skip_if_exists() {
 cleanup_on_exit() {
     echo -e "\n${YELLOW}Interrupt received. Stopping background jobs...${RESET}"
     for pid in "${BG_JOB_PIDS[@]}"; do
-        kill "$pid" 2>/dev/null && log WARN "Killed background job PID: ${pid}"
+        if kill -0 "$pid" 2>/dev/null; then
+            # Kill the entire process group to catch sudo/child wrappers (e.g. Responder)
+            local pgid
+            pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' | head -1)
+            if [[ -n "$pgid" && "$pgid" -ne "$$" && "$pgid" -ne "0" ]]; then
+                sudo kill -- "-${pgid}" 2>/dev/null \
+                    || kill -- "-${pgid}" 2>/dev/null \
+                    || kill "$pid" 2>/dev/null
+            else
+                kill "$pid" 2>/dev/null
+            fi
+            log WARN "Killed background job PID: ${pid} (pgid: ${pgid:-unknown})"
+        fi
     done
     log WARN "Session interrupted by operator"
     exit 1
