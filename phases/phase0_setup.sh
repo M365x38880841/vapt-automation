@@ -192,13 +192,15 @@ if [[ ${#MISSING_REQUIRED[@]} -gt 0 ]]; then
             roadrecon)
                 pip_install roadrecon || { log ERROR "Failed to install roadrecon"; exit 1; } ;;
             az)
-                # Prefer apt over curl-pipe-to-bash for auditability and reliability
-                if apt-cache show azure-cli &>/dev/null 2>&1; then
-                    sudo apt-get install -y azure-cli
-                else
-                    log WARN "azure-cli not in apt sources — installing via Microsoft script"
-                    curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-                fi
+                # Microsoft's official install script — works reliably on Kali.
+                # The azure-cli apt package in Kali repos lags behind and frequently
+                # breaks because Kali is Debian-based but not a supported distro for
+                # Microsoft's own apt repo. The install script pins the correct
+                # Microsoft repo, imports the GPG key, and handles it automatically
+                # regardless of the underlying Debian base version.
+                log INFO "Installing Azure CLI via Microsoft install script..."
+                curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash \
+                    || { log ERROR "Azure CLI install failed — check network and retry"; exit 1; }
                 ;;
             docker)
                 # Docker is handled by ensure_docker() at the top of this script.
