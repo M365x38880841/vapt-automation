@@ -125,18 +125,27 @@ Phase 0 Complete — Automated Checks Passed
 **Run:**
 ```bash
 python3 orchestrator.py --phase 1
+
+# Skip the overnight Nmap scan (e.g. already running from yesterday)
+python3 orchestrator.py --phase 1 --skip nmap_fullscan
+
+# Run only BloodHound and ROADrecon (skip network scanning entirely)
+python3 orchestrator.py --phase 1 --only bloodhound,roadrecon
+
+# See all step keys for this phase
+python3 orchestrator.py --phase 1 --list-steps
 ```
 
 **What happens automatically:**
-1. Host sweep across all `TARGET_SUBNETS` (parallel, one Nmap `-sn` per subnet)
-2. Full port scan launched as background job against live hosts (runs overnight)
-3. CrackMapExec SMB sweep — signs, shares, SMB signing status
-4. LDAP rootdse banner grab
-5. LDAP user enumeration → `userlist.txt`
-6. SMB null session check
-7. BloodHound data collection (`-c All`) as background job
-8. ROADrecon Entra ID gather (background if password auth; foreground if device code)
-9. Azure resource inventory across all subscriptions (per-subscription JSON files merged)
+1. `host_sweep` — Host sweep across all `TARGET_SUBNETS` (parallel, one Nmap `-sn` per subnet)
+2. `nmap_fullscan` — Full port scan launched as background job against live hosts (runs overnight)
+3. `smb_sweep` — CrackMapExec SMB sweep — signing, shares, SMB signing status
+4. `ldap_banner` — LDAP rootdse banner grab
+5. `ldap_users` — LDAP user enumeration → `userlist.txt`
+6. `null_session` — SMB null session check
+7. `bloodhound` — BloodHound data collection (`-c All`) as background job
+8. `roadrecon` — ROADrecon Entra ID gather (background if password auth; foreground if device code)
+9. `azure_inventory` — Azure resource inventory across all subscriptions (per-subscription JSON files merged)
 
 **Operator actions during Phase 1:**
 - Confirm the full port scan checkpoint (it will run overnight — confirm before EOD)
@@ -178,16 +187,23 @@ python3 orchestrator.py --phase 1
 **Run:**
 ```bash
 python3 orchestrator.py --phase 2
+
+# Skip ScoutSuite (already ran yesterday) and ZAP (no web targets in scope)
+python3 orchestrator.py --phase 2 --skip scoutsuite,zap
+
+# Run only AD checks (certipy + SMB vulns + password policy)
+python3 orchestrator.py --phase 2 --only ad_checks
+
+# See all step keys for this phase
+python3 orchestrator.py --phase 2 --list-steps
 ```
 
 **What happens automatically:**
-1. ScoutSuite Azure audit — one background job per subscription (25–45 min each)
-2. Azure targeted security checks: public blob access, NSG any-inbound rules, Key Vault policies, over-privileged role assignments, storage HTTPS enforcement, Conditional Access policies
-3. AD security checks: Kerberoastable accounts, AS-REP roastable accounts, password policy, accessible shares, Domain Admins group, unconstrained delegation, password-never-expires accounts
-4. **AD CS (certipy)**: ESC1–ESC8 certificate template misconfiguration checks
-5. **SMB vulnerability modules**: ms17-010, nopac, petitpotam
-6. **OWASP ZAP DAST**: baseline (passive) or full (active) web scan per URL in `WEB_TARGETS`
-7. Nessus API trigger (if configured)
+1. `scoutsuite` — ScoutSuite Azure audit — one background job per subscription (25–45 min each)
+2. `azure_security` — Azure targeted security checks: public blob access, NSG any-inbound rules, Key Vault policies, over-privileged role assignments, storage HTTPS enforcement, Conditional Access policies
+3. `ad_checks` — AD security checks: Kerberoastable accounts, AS-REP roastable accounts, password policy, accessible shares, Domain Admins group, unconstrained delegation, password-never-expires accounts; **AD CS certipy** ESC1–ESC8; **SMB vuln modules** ms17-010, nopac, petitpotam
+4. `zap` — OWASP ZAP DAST: baseline (passive) or full (active) web scan per URL in `WEB_TARGETS`
+5. `nessus` — Nessus API trigger (if configured)
 
 **Operator actions during Phase 2:**
 - Confirm ScoutSuite audit checkpoints
@@ -223,18 +239,27 @@ python3 orchestrator.py --phase 2
 **Run:**
 ```bash
 python3 orchestrator.py --phase 3
+
+# Responder already running from earlier — skip it, run kerberoast + hashcat only
+python3 orchestrator.py --phase 3 --skip responder --only kerberoast,asrep,hashcat
+
+# Hashes cracked overnight — run only PtH sweep
+python3 orchestrator.py --phase 3 --only pth_sweep
+
+# See all step keys for this phase
+python3 orchestrator.py --phase 3 --list-steps
 ```
 
 **What happens automatically (with checkpoints):**
 1. Responder started (background, runs for `RESPONDER_DURATION` seconds)
 2. Kerberoasting — TGS ticket request for all Kerberoastable accounts
 3. AS-REP Roasting — AS-REP hash request for pre-auth disabled accounts
-4. Hashcat NTLMv2 cracking (3 background jobs: rockyou, rules, corporate patterns)
-5. Hashcat TGS cracking (if tickets obtained)
-6. Hashcat AS-REP cracking (if hashes obtained)
-7. NTLM relay setup (if relay targets exist) — requires operator target confirmation
-8. Pass-the-Hash sweep (if `OBTAINED_HASH` was provided at prompt)
-9. Azure public storage container access check (PoC)
+4. `hashcat` — Hashcat NTLMv2 cracking (3 background jobs: rockyou, rules, corporate patterns)
+5. `hashcat` — Hashcat TGS cracking (if tickets obtained)
+6. `hashcat` — Hashcat AS-REP cracking (if hashes obtained)
+7. `ntlm_relay` — NTLM relay setup (if relay targets exist) — requires operator target confirmation
+8. `pth_sweep` — Pass-the-Hash sweep (if `OBTAINED_HASH` was provided at prompt)
+9. `azure_storage` — Azure public storage container access check (PoC)
 
 **Operator actions during Phase 3:**
 - Confirm Responder start checkpoint
@@ -270,16 +295,25 @@ cat ~/vapt/phase3/ad/cracked_tgs.txt
 **Run:**
 ```bash
 python3 orchestrator.py --phase 4
+
+# Skip DCSync and lateral movement — run blast radius assessment only
+python3 orchestrator.py --phase 4 --only azure_blast_radius,blast_summary
+
+# Skip SAM sweep (no PtH hosts confirmed yet)
+python3 orchestrator.py --phase 4 --skip sam_sweep
+
+# See all step keys for this phase
+python3 orchestrator.py --phase 4 --list-steps
 ```
 
 **What happens automatically (with checkpoints):**
-1. CrackMapExec sweep across all confirmed PtH-accessible hosts (system info + local admins)
-2. SAM dump on confirmed admin hosts (per-host checkpoint)
+1. `sam_sweep` — CrackMapExec sweep across all confirmed PtH-accessible hosts (system info + local admins)
+2. `sam_sweep` — SAM dump on confirmed admin hosts (per-host checkpoint)
 3. Blast radius log initialised (`blast_radius.md`)
-4. Interactive lateral movement loop (operator selects targets, tool, credentials)
-5. DCSync PoC (maximum gate — BloodHound path confirmation required; krbtgt is blocked)
-6. Azure blast radius documentation (accessible resources from current identity)
-7. Blast radius summary report generated
+4. `lateral_move` — Interactive lateral movement loop (operator selects targets, tool, credentials)
+5. `dcsync` — DCSync PoC (maximum gate — BloodHound path confirmation required; krbtgt is blocked)
+6. `azure_blast_radius` — Azure blast radius documentation (accessible resources from current identity)
+7. `blast_summary` — Blast radius summary report generated
 
 **DCSync gate:**
 The framework blocks DCSync against `krbtgt` and requires explicit account name input. Only run DCSync if BloodHound has confirmed a DCSync path exists. Target a **test or non-sensitive account** to prove the capability — do not dump the entire directory.
@@ -346,6 +380,82 @@ python3 orchestrator.py --phase 5
 | Hashcat TGS | `phase3/ad/hashcat_tgs.log` | `tail -f <log>` | `cracked_tgs.txt` populated | **Yes** — local CPU/GPU only |
 
 > **Rule:** Jobs with no outbound network traffic (Hashcat) or read-only API queries (ScoutSuite, Azure inventory, Nmap) are overnight-safe. Active network poisoning (Responder) is **not** overnight-safe and will auto-stop via `atd` scheduling.
+
+---
+
+## 9b. Selective Step Execution Reference
+
+Use `--skip` or `--only` to control exactly which steps run within a phase. This is useful when:
+- A background job is already running from a previous session (skip it)
+- You only need to re-run one specific check (use `--only`)
+- Certain steps are out of scope for this engagement
+- A step failed and you want to re-run just that step
+
+### Quick reference
+
+```bash
+# List every skippable step key across all phases
+python3 orchestrator.py --list-steps
+
+# List step keys for one phase only
+python3 orchestrator.py --phase 2 --list-steps
+
+# Skip one step
+python3 orchestrator.py --phase 1 --skip nmap_fullscan
+
+# Skip multiple steps (comma-separated, no spaces)
+python3 orchestrator.py --phase 2 --skip scoutsuite,zap,nessus
+
+# Run only these steps, skip everything else in the phase
+python3 orchestrator.py --phase 1 --only bloodhound,roadrecon
+
+# --skip and --only cannot be combined — use one or the other
+```
+
+### All step keys by phase
+
+| Phase | Key | Description |
+|-------|-----|-------------|
+| 1 | `host_sweep` | Nmap host sweep across all subnets |
+| 1 | `nmap_fullscan` | Nmap full port scan -p- (background, overnight) |
+| 1 | `smb_sweep` | CrackMapExec SMB sweep + signing check |
+| 1 | `ldap_banner` | LDAP rootDSE banner grab from DC |
+| 1 | `ldap_users` | LDAP domain user enumeration |
+| 1 | `null_session` | SMB null session check |
+| 1 | `bloodhound` | BloodHound data collection |
+| 1 | `roadrecon` | ROADrecon Entra ID gather |
+| 1 | `azure_inventory` | Azure resource inventory across subscriptions |
+| 2 | `scoutsuite` | ScoutSuite Azure audit (per subscription) |
+| 2 | `azure_security` | Azure targeted security checks (MFA, RBAC, storage, NSG, KeyVault) |
+| 2 | `ad_checks` | AD checks: password policy, Kerberoastable accounts, certipy AD CS, SMB vulns |
+| 2 | `zap` | OWASP ZAP web DAST scan |
+| 2 | `nessus` | Nessus credentialed scan trigger via API |
+| 3 | `responder` | Responder LLMNR/NBT-NS poisoning (background) |
+| 3 | `kerberoast` | Kerberoasting — TGS ticket request for SPN accounts |
+| 3 | `asrep` | AS-REP Roasting — accounts with pre-auth disabled |
+| 3 | `hashcat` | Hashcat cracking jobs (NTLMv2, TGS, AS-REP) |
+| 3 | `ntlm_relay` | NTLM relay setup (Responder relay mode + ntlmrelayx) |
+| 3 | `pth_sweep` | Pass-the-Hash sweep with obtained hash |
+| 3 | `azure_storage` | Azure public storage container check |
+| 4 | `sam_sweep` | Automated SAM dump on confirmed PtH hosts |
+| 4 | `lateral_move` | Interactive PsExec / WMIexec lateral movement |
+| 4 | `dcsync` | DCSync PoC (maximum gate) |
+| 4 | `azure_blast_radius` | Azure blast radius assessment from compromised identity |
+| 4 | `blast_summary` | Blast radius summary report generation |
+
+### How it interacts with idempotency
+
+`--skip` / `--only` and file-based idempotency (`skip_if_exists`) are independent and layer on top of each other:
+
+- `--skip nmap_fullscan` → skips the step regardless of whether `fullscan.xml` exists
+- No flag, `fullscan.xml` exists → `skip_if_exists` skips it automatically
+- No flag, `fullscan.xml` missing → step runs normally
+
+To force a step to re-run even if its output file already exists, delete the output file:
+```bash
+rm ~/vapt/phase1/network/fullscan.xml
+python3 orchestrator.py --phase 1 --only nmap_fullscan
+```
 
 ---
 

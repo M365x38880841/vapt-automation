@@ -126,6 +126,46 @@ PHASES = {
     },
 }
 
+# ─── STEP REGISTRY ────────────────────────────────────────────────────────────
+# Maps step keys (passed to --skip / --only) to human descriptions.
+# These keys must match the values used in _step_is_skipped() calls in phase scripts.
+STEP_REGISTRY = {
+    1: {
+        "host_sweep":      "Nmap host sweep across all subnets",
+        "nmap_fullscan":   "Nmap full port scan -p- (background, overnight)",
+        "smb_sweep":       "CrackMapExec SMB sweep + signing check",
+        "ldap_banner":     "LDAP rootDSE banner grab from DC",
+        "ldap_users":      "LDAP domain user enumeration",
+        "null_session":    "SMB null session check",
+        "bloodhound":      "BloodHound data collection",
+        "roadrecon":       "ROADrecon Entra ID gather",
+        "azure_inventory": "Azure resource inventory across subscriptions",
+    },
+    2: {
+        "scoutsuite":      "ScoutSuite Azure audit (per subscription)",
+        "azure_security":  "Azure targeted security checks (MFA, RBAC, storage, NSG, KeyVault)",
+        "ad_checks":       "AD security checks: password policy, Kerberoastable accounts, certipy AD CS, SMB vulns",
+        "zap":             "OWASP ZAP web DAST scan",
+        "nessus":          "Nessus credentialed scan trigger via API",
+    },
+    3: {
+        "responder":       "Responder LLMNR/NBT-NS poisoning (background)",
+        "kerberoast":      "Kerberoasting — TGS ticket request for SPN accounts",
+        "asrep":           "AS-REP Roasting — accounts with pre-auth disabled",
+        "hashcat":         "Hashcat cracking jobs (NTLMv2, TGS, AS-REP)",
+        "ntlm_relay":      "NTLM relay setup (Responder relay mode + ntlmrelayx)",
+        "pth_sweep":       "Pass-the-Hash sweep with obtained hash",
+        "azure_storage":   "Azure public storage container check",
+    },
+    4: {
+        "sam_sweep":          "Automated SAM dump on confirmed PtH hosts",
+        "lateral_move":       "Interactive PsExec / WMIexec lateral movement",
+        "dcsync":             "DCSync PoC (maximum gate)",
+        "azure_blast_radius": "Azure blast radius assessment from compromised identity",
+        "blast_summary":      "Blast radius summary report generation",
+    },
+}
+
 # ─── CREDENTIAL REGISTRY ──────────────────────────────────────────────────────
 CREDENTIAL_PROMPTS = {
     "DOMAIN_USER":   "Domain username (e.g. testuser)",
@@ -258,7 +298,8 @@ def collect_credentials(secrets_needed: list[str]) -> dict:
 
 # ─── PHASE RUNNER ─────────────────────────────────────────────────────────────
 
-def run_phase(phase_num: int, config: dict, creds: dict, dry_run: bool, log_file: Path):
+def run_phase(phase_num: int, config: dict, creds: dict, dry_run: bool, log_file: Path,
+              skip: str = "", only: str = ""):
     phase = PHASES[phase_num]
     phase_banner(phase_num, phase["name"], phase["days"])
 
@@ -304,6 +345,12 @@ def run_phase(phase_num: int, config: dict, creds: dict, dry_run: bool, log_file
     env["PHASE_NUM"] = str(phase_num)
     env["LOG_FILE"] = str(log_file)
     env["DRY_RUN"] = "false"
+    if skip:
+        env["SKIP_STEPS"] = skip
+        info(f"Steps excluded this run: {skip}")
+    if only:
+        env["ONLY_STEPS"] = only
+        info(f"Running only steps: {only}")
 
     checkpoint(f"Execute Phase {phase_num}: {phase['name']}")
 
@@ -333,12 +380,21 @@ def main():
         description="Ha-Shem VAPT Engagement Orchestrator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config",    default="config.env", help="Path to config file (default: config.env)")
-    parser.add_argument("--phase",     default="all",        help="Phase(s) to run: 0,1,2,3,4,5 or 'all'")
-    parser.add_argument("--dry-run",   action="store_true",  help="Show what would run without executing")
-    parser.add_argument("--status",    action="store_true",  help="Show phase completion status from logs")
-    parser.add_argument("--list",      action="store_true",  help="List all phases and their automation status")
+    parser.add_argument("--config",     default="config.env", help="Path to config file (default: config.env)")
+    parser.add_argument("--phase",      default="all",        help="Phase(s) to run: 0,1,2,3,4,5 or 'all'")
+    parser.add_argument("--dry-run",    action="store_true",  help="Show what would run without executing")
+    parser.add_argument("--status",     action="store_true",  help="Show phase completion status from logs")
+    parser.add_argument("--list",       action="store_true",  help="List all phases and their automation status")
+    parser.add_argument("--list-steps", action="store_true",  help="List skippable step keys for each phase")
+    parser.add_argument("--skip",       default="",           metavar="STEPS",
+                        help="Comma-separated step keys to skip, e.g. --skip nmap_fullscan,scoutsuite")
+    parser.add_argument("--only",       default="",           metavar="STEPS",
+                        help="Run only these step keys (skip all others), e.g. --only bloodhound,roadrecon")
     args = parser.parse_args()
+
+    if args.skip and args.only:
+        error("--skip and --only are mutually exclusive. Use one or the other.")
+        sys.exit(1)
 
     print(BANNER)
 
@@ -350,6 +406,26 @@ def main():
             auto = p["automatable"]
             label = f"{G}Full{RESET}" if auto is True else (f"{Y}Partial{RESET}" if auto == "partial" else f"{R}Manual{RESET}")
             print(f"  {num:<6} {p['name']:<30} {label:<25} {p['days']}")
+        return
+
+    # ── List steps mode
+    if args.list_steps:
+        filter_phases = []
+        if args.phase != "all":
+            try:
+                filter_phases = [int(p.strip()) for p in args.phase.split(",")]
+            except ValueError:
+                pass
+        print(f"\n{BOLD}Skippable step keys  (use with --skip or --only){RESET}")
+        print(f"{C}Example: python3 orchestrator.py --phase 1 --skip nmap_fullscan,smb_sweep{RESET}\n")
+        for phase_num, steps in STEP_REGISTRY.items():
+            if filter_phases and phase_num not in filter_phases:
+                continue
+            p = PHASES.get(phase_num, {})
+            print(f"{BOLD}{M}  Phase {phase_num} — {p.get('name', '')}{RESET}")
+            for key, desc in steps.items():
+                print(f"    {G}{key:<22}{RESET}  {desc}")
+            print()
         return
 
     # ── Load and validate config
@@ -491,7 +567,8 @@ def main():
         if phase_num not in PHASES:
             warn(f"Unknown phase: {phase_num}. Skipping.")
             continue
-        run_phase(phase_num, config, creds, args.dry_run, log_file)
+        run_phase(phase_num, config, creds, args.dry_run, log_file,
+                  skip=args.skip, only=args.only)
         if phase_num < max(phases_to_run):
             print(f"\n{BOLD}  Phase {phase_num} complete. Ready for Phase {phase_num + 1}? [ENTER/q]: {RESET}", end="")
             if input().strip().lower() == "q":

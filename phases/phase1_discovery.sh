@@ -28,10 +28,22 @@ log INFO "Starting host sweep across all subnets (parallel)..."
 LIVE_HOSTS_MERGED="${OUT_NET}/live_hosts_all.txt"
 > "${LIVE_HOSTS_MERGED}"  # clear/create
 
+if _step_is_skipped "host_sweep"; then
+    # Still need live hosts list for downstream steps — re-merge from any existing sweeps
+    for subnet in ${TARGET_SUBNETS}; do
+        safe_name="${subnet//\//_}"
+        gnmap="${OUT_NET}/hostsweep_${safe_name}.gnmap"
+        [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}" || true
+    done
+    sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}" 2>/dev/null || true
+    LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}" 2>/dev/null || echo 0)
+    log INFO "host_sweep skipped — using existing live hosts file (${LIVE_COUNT} hosts)"
+else
+
 for subnet in ${TARGET_SUBNETS}; do
     safe_name="${subnet//\//_}"
     sweep_out="${OUT_NET}/hostsweep_${safe_name}"
-    if skip_if_exists "${sweep_out}.gnmap" "Host sweep ${subnet}"; then
+    if skip_if_exists "${sweep_out}.gnmap" "Host sweep ${subnet}" "host_sweep"; then
         grep 'Up' "${sweep_out}.gnmap" 2>/dev/null | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}" || true
         continue
     fi
@@ -56,11 +68,13 @@ sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}"
 LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}")
 log OK "Host sweep complete. Live hosts found: ${LIVE_COUNT} → ${LIVE_HOSTS_MERGED}"
 
-[[ "${LIVE_COUNT}" -eq 0 ]] && { log ERROR "No live hosts found. Check subnets and interface."; exit 1; }
+fi  # end host_sweep skip gate
+
+[[ "${LIVE_COUNT:-0}" -eq 0 ]] && { log ERROR "No live hosts found. Check subnets and interface."; exit 1; }
 
 # ─── STEP 1.2 — FULL PORT SCAN (background — runs overnight) ────────────────
 FULLSCAN_OUT="${OUT_NET}/fullscan"
-if ! skip_if_exists "${FULLSCAN_OUT}.xml" "Full port scan"; then
+if ! skip_if_exists "${FULLSCAN_OUT}.xml" "Full port scan" "nmap_fullscan"; then
     checkpoint "Start full port scan (-p- against ${LIVE_COUNT} hosts). This runs in background and may take 3–5 hours."
     log INFO "Launching full port scan as background job (overnight-friendly)..."
     bg_run "nmap_fullscan" \
@@ -76,7 +90,7 @@ fi
 
 # ─── STEP 1.3 — SMB SWEEP + SIGNING CHECK (background) ──────────────────────
 SMB_OUT="${OUT_AD}/smb_sweep.txt"
-if ! skip_if_exists "${SMB_OUT}" "CrackMapExec SMB sweep"; then
+if ! skip_if_exists "${SMB_OUT}" "CrackMapExec SMB sweep" "smb_sweep"; then
     log INFO "Starting CrackMapExec SMB sweep (signing + host enumeration)..."
     bg_run "cmexec_smb_sweep" \
         "${OUT_AD}/smb_sweep.log" \
@@ -90,7 +104,7 @@ fi
 
 # ─── STEP 1.4 — LDAP DC BANNER GRAB (active — quick) ─────────────────────────
 LDAP_OUT="${OUT_AD}/ldap_rootdse.txt"
-if ! skip_if_exists "${LDAP_OUT}" "LDAP rootdse"; then
+if ! skip_if_exists "${LDAP_OUT}" "LDAP rootdse" "ldap_banner"; then
     log INFO "Grabbing LDAP rootdse from DC: ${DC_IP}"
     log_cmd "${NMAP_BIN} -p 389 --script ldap-rootdse ${DC_IP}"
     "${NMAP_BIN:-nmap}" -p 389 --script ldap-rootdse "${DC_IP}" \
@@ -100,7 +114,7 @@ fi
 
 # ─── STEP 1.5 — LDAP USER ENUMERATION (active — quick) ───────────────────────
 LDAP_USERS_OUT="${OUT_AD}/ldap_users.txt"
-if ! skip_if_exists "${LDAP_USERS_OUT}" "LDAP user enumeration"; then
+if ! skip_if_exists "${LDAP_USERS_OUT}" "LDAP user enumeration" "ldap_users"; then
     log INFO "Enumerating domain users via LDAP..."
     log_cmd "ldapsearch -H ldap://${DC_IP} -D ${DOMAIN_USER}@${DOMAIN_NAME} -w *** -b DC=..."
     ldapsearch -H "ldap://${DC_IP}" \
@@ -119,21 +133,27 @@ if ! skip_if_exists "${LDAP_USERS_OUT}" "LDAP user enumeration"; then
 fi
 
 # ─── STEP 1.6 — SMB NULL SESSION CHECK (active — instant) ───────────────────
-log INFO "Checking for SMB null session (should be blocked)..."
-log_cmd "${CME_BIN} smb ${DC_IP} --null-session"
-"${CME_BIN}" smb "${DC_IP}" --null-session \
-    2>&1 > "${OUT_AD}/nullsession_check.txt" || true
-if grep -q 'STATUS_ACCESS_DENIED\|STATUS_LOGON_FAILURE' "${OUT_AD}/nullsession_check.txt" 2>/dev/null; then
-    log OK "Null session blocked (expected)"
-else
-    log WARN "Null session may be accessible — review: ${OUT_AD}/nullsession_check.txt"
+if ! _step_is_skipped "null_session"; then
+    log INFO "Checking for SMB null session (should be blocked)..."
+    log_cmd "${CME_BIN} smb ${DC_IP} --null-session"
+    "${CME_BIN}" smb "${DC_IP}" --null-session \
+        2>&1 > "${OUT_AD}/nullsession_check.txt" || true
+    if grep -q 'STATUS_ACCESS_DENIED\|STATUS_LOGON_FAILURE' "${OUT_AD}/nullsession_check.txt" 2>/dev/null; then
+        log OK "Null session blocked (expected)"
+    else
+        log WARN "Null session may be accessible — review: ${OUT_AD}/nullsession_check.txt"
+    fi
 fi
 
 # ─── STEP 1.7 — BLOODHOUND DATA COLLECTION (background) ──────────────────────
 BH_OUT_DIR="${OUT_AD}/bloodhound"
 mkdir -p "${BH_OUT_DIR}"
 BH_ZIP=$(ls "${BH_OUT_DIR}"/*.zip 2>/dev/null | head -1)
-if [[ -z "${BH_ZIP}" ]]; then
+if _step_is_skipped "bloodhound"; then
+    : # skip
+elif [[ -n "${BH_ZIP}" ]]; then
+    log INFO "BloodHound ZIP already exists: ${BH_ZIP} — skipping collection"
+else
     log INFO "Starting BloodHound data collection (-c All)..."
     bg_run "bloodhound_collect" \
         "${OUT_AD}/bloodhound_collect.log" \
@@ -146,13 +166,11 @@ if [[ -z "${BH_ZIP}" ]]; then
             --zip \
             -o "${BH_OUT_DIR}"
     log INFO "BloodHound collection running in background."
-else
-    log INFO "BloodHound ZIP already exists: ${BH_ZIP} — skipping collection"
 fi
 
 # ─── STEP 1.8 — ROADRECON ENTRA ID GATHER ────────────────────────────────────
 ROAD_DB="${OUT_CLOUD}/roadrecon.db"
-if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather"; then
+if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
     log INFO "Starting ROADrecon Entra ID gather..."
     if [[ "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]]; then
         # Device code flow: modern tenants with MFA/CA — runs in foreground (interactive)
@@ -178,7 +196,7 @@ fi
 
 # ─── STEP 1.9 — AZURE RESOURCE INVENTORY (background) ────────────────────────
 AZURE_INV="${OUT_CLOUD}/azure_inventory.json"
-if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory"; then
+if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory" "azure_inventory"; then
     log INFO "Starting Azure resource inventory across all subscriptions..."
     bg_run "azure_inventory" \
         "${OUT_CLOUD}/azure_inventory.log" \

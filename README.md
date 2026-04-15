@@ -92,14 +92,69 @@ python3 orchestrator.py --phase 0
 # 6. Run a single phase interactively
 python3 orchestrator.py --phase 1
 
-# 7. Check phase completion status
+# 7. Check phase and overnight background job status
 python3 orchestrator.py --status
 
 # 8. Run all remaining phases in sequence
 python3 orchestrator.py --phase 1,2,3,4,5
+
+# 9. List all phases and their automation level
+python3 orchestrator.py --list
+
+# 10. List skippable step keys for a phase
+python3 orchestrator.py --phase 2 --list-steps
+
+# 11. Skip specific steps within a phase
+python3 orchestrator.py --phase 2 --skip scoutsuite,zap
+
+# 12. Run only specific steps within a phase (skip everything else)
+python3 orchestrator.py --phase 1 --only bloodhound,roadrecon
 ```
 
+### Selective step execution
+
+Every automated step within a phase has a named key. You can include or exclude steps at runtime without editing any script.
+
+```bash
+# See all step keys across every phase
+python3 orchestrator.py --list-steps
+
+# See keys for one phase only
+python3 orchestrator.py --phase 3 --list-steps
+
+# Skip one or more steps  (run everything else)
+python3 orchestrator.py --phase 1 --skip nmap_fullscan
+python3 orchestrator.py --phase 2 --skip scoutsuite,zap,nessus
+python3 orchestrator.py --phase 3 --skip responder,hashcat
+
+# Run only the named steps (skip everything else in that phase)
+python3 orchestrator.py --phase 1 --only bloodhound,roadrecon
+python3 orchestrator.py --phase 2 --only ad_checks
+```
+
+`--skip` and `--only` are mutually exclusive. Idempotency still applies on top — if a step's output file already exists it is skipped regardless.
+
 > **Before running Phase 3 or 4**, ensure you have confirmed with the emergency contact and that the RoE explicitly covers exploitation activities.
+
+### If tool installations are broken
+
+If Phase 0 has been run multiple times or tools were installed manually alongside it, conflicting copies can accumulate (same tool in apt, pip, and pipx simultaneously). Use the purge script to wipe all framework-managed tools and start clean:
+
+```bash
+# See what would be removed without touching anything
+bash tools/purge_tools.sh --dry-run
+
+# Interactive purge — prompts before each tool group
+bash tools/purge_tools.sh
+
+# Full reset without prompts
+bash tools/purge_tools.sh --yes
+
+# Then reinstall cleanly
+python3 orchestrator.py --phase 0
+```
+
+See [docs/MAINTENANCE.md §7](docs/MAINTENANCE.md#7-purging-a-broken-installation) for the full reference.
 
 ---
 
@@ -291,10 +346,10 @@ Access the UI at **http://localhost:8080**. Import the BloodHound ZIP from `~/va
 
 ## Monitoring Background Jobs
 
-Long-running jobs (Nmap, Hashcat, Responder, ScoutSuite, ZAP) run in the background. Monitor them:
+Long-running jobs (Nmap, Hashcat, Responder, ScoutSuite, ZAP) run in the background via `nohup` + `disown` and survive terminal close. Monitor them:
 
 ```bash
-# Framework-level status (reads engagement log)
+# Morning briefing — phase status + overnight job results
 python3 orchestrator.py --status
 
 # Nmap full scan progress
@@ -323,6 +378,8 @@ pkill -f "responder|hashcat|nmap|bloodhound-python|roadrecon|scout|zaproxy"
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, tool selection rationale, extension guide |
 | [docs/SECURITY.md](docs/SECURITY.md) | Credential lifecycle, audit trail, responsible use policy |
 | [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | Updating dependencies, adding checks, known Kali issues |
+| [tools/verify.sh](tools/verify.sh) | Pre-engagement environment verification (run 48h before Day 1) |
+| [tools/purge_tools.sh](tools/purge_tools.sh) | Clean-slate removal of all framework-managed tools |
 
 ---
 

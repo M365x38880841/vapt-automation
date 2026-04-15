@@ -15,8 +15,9 @@ This document is for the person responsible for keeping the framework current be
 4. [Adding a New Automated Check](#4-adding-a-new-automated-check)
 5. [Adding a New Tool](#5-adding-a-new-tool)
 6. [Known Kali Compatibility Issues](#6-known-kali-compatibility-issues)
-7. [Pre-Engagement Verification Checklist](#7-pre-engagement-verification-checklist)
-8. [Versioning and Change Management](#8-versioning-and-change-management)
+7. [Purging a Broken Installation](#7-purging-a-broken-installation)
+8. [Pre-Engagement Verification Checklist](#8-pre-engagement-verification-checklist)
+9. [Versioning and Change Management](#9-versioning-and-change-management)
 
 ---
 
@@ -193,10 +194,12 @@ Follow this pattern to add a new check to any phase. Use Phase 2 as an example.
 
 ### Step 1 — Write the check in the phase script
 
+Pass the step key as the third argument to `skip_if_exists`. This is what wires the check into the `--skip` / `--only` system.
+
 ```bash
 # ─── STEP 2.X — CONSTRAINED DELEGATION CHECK ─────────────────────────────────
 CONSTRAINED_OUT="${AD_CHECKS}/constrained_delegation.txt"
-if ! skip_if_exists "${CONSTRAINED_OUT}" "Constrained delegation check"; then
+if ! skip_if_exists "${CONSTRAINED_OUT}" "Constrained delegation check" "constrained_delegation"; then
     log INFO "Checking for constrained delegation (msDS-AllowedToDelegateTo)..."
     log_cmd "ldapsearch -H ldap://${DC_IP} ... (constrained delegation filter)"
     ldapsearch -H "ldap://${DC_IP}" \
@@ -212,7 +215,29 @@ if ! skip_if_exists "${CONSTRAINED_OUT}" "Constrained delegation check"; then
 fi
 ```
 
-### Step 2 — Add to the finding summary block
+For steps that don't use `skip_if_exists` (e.g. steps with no single output file), use `_step_is_skipped` directly:
+
+```bash
+if ! _step_is_skipped "constrained_delegation"; then
+    # ... step body ...
+fi
+```
+
+### Step 2 — Register the step key in orchestrator.py
+
+Add the key and description to `STEP_REGISTRY` in `orchestrator.py`. This makes it visible in `--list-steps` output.
+
+```python
+# In STEP_REGISTRY, under the relevant phase number:
+2: {
+    ...
+    "constrained_delegation": "AD constrained delegation check (msDS-AllowedToDelegateTo)",
+},
+```
+
+> **This is a breaking change if the key is referenced in documentation or operator runbooks.** Rename carefully — see Section 9.
+
+### Step 3 — Add to the finding summary block
 
 In the same phase script, add the count to the end-of-phase summary:
 
@@ -221,7 +246,7 @@ In the same phase script, add the count to the end-of-phase summary:
     echo -e "${YELLOW}  Constrained delegation accounts: ${CON_COUNT:-?}${RESET}"
 ```
 
-### Step 3 — Add to Phase 5 consolidation
+### Step 4 — Add to Phase 5 consolidation
 
 In `phases/phase5_consolidate.sh`:
 
@@ -236,9 +261,10 @@ cp -u "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/constrained_delegation.txt" "${EVI
 | Constrained delegation accounts | ${CON_DELEG} | evidence/ad/constrained_delegation.txt |
 ```
 
-### Step 4 — Update the README
+### Step 5 — Update the docs
 
-Add the new check to the "What is automated" list in `README.md`.
+- Add the step key to the step table in `docs/RUNBOOK.md §9b`
+- Add the check to the "What is automated" list in `README.md`
 
 ---
 
@@ -374,7 +400,64 @@ pipx list | grep certipy
 
 ---
 
-## 7. Pre-Engagement Verification Checklist
+## 7. Purging a Broken Installation
+
+Use `tools/purge_tools.sh` when tool installations have become inconsistent — for example when the same tool was installed via apt, pip, and pipx simultaneously, leaving conflicting binaries on PATH, or when an Azure CLI install from the Kali repo left behind a stale apt source that prevents the Microsoft version from installing cleanly.
+
+### When to use it
+
+- Azure CLI reports version mismatches or authentication errors that survive `az login`
+- `which az` returns an unexpected path (e.g. `/usr/bin/az` instead of `/usr/bin/az` from the Microsoft repo)
+- `pip3 show bloodhound` and `pipx list` both show bloodhound — two copies fighting for the same binary name
+- Phase 0 installs a tool but the wrong version is invoked because an older apt-installed copy takes PATH precedence
+- Any `command -v <tool>` returns a path you did not expect
+
+### Usage
+
+```bash
+# Interactive — prompts before removing each group
+bash tools/purge_tools.sh
+
+# Dry run — shows exactly what would be removed without touching anything
+bash tools/purge_tools.sh --dry-run
+
+# Non-interactive — removes everything without prompting (CI / full reset)
+bash tools/purge_tools.sh --yes
+```
+
+### What it removes
+
+| Group | Scope |
+|-------|-------|
+| Azure CLI | apt package, Microsoft apt repo entry, GPG key(s), pip3 install, pipx install, optionally `~/.azure` |
+| Python tools | bloodhound, roadrecon, impacket, certipy-ad, scoutsuite — from both pipx and system pip3 |
+| Docker | All CE packages, legacy docker.io, apt repo entry, GPG key, optionally `/var/lib/docker` |
+| nxc / crackmapexec | apt, pip3, and pipx installs of both binary names |
+| apt cache | `apt-get clean` + `autoclean` |
+
+Each group is independently confirmable in interactive mode — if only Azure CLI is broken, purge that group and skip the rest.
+
+> **Warning:** Removing Docker also destroys the BloodHound CE database (Neo4j volume). If collected BloodHound data needs to be preserved, export it from the BloodHound UI before running the purge.
+
+### After purging
+
+Re-run Phase 0 to reinstall everything cleanly:
+
+```bash
+python3 orchestrator.py --phase 0
+```
+
+Or verify the current state first without making any changes:
+
+```bash
+bash tools/verify.sh
+```
+
+---
+
+## 8. Pre-Engagement Verification Checklist
+
+> The automated version of this checklist is `tools/verify.sh`. Run it instead of the manual steps below when possible.
 
 Run this on the attack machine at least 48 hours before the engagement starts. This allows time to fix issues before Day 1.
 
@@ -421,7 +504,7 @@ Save this as `tools/verify.sh` and run it before each engagement.
 
 ---
 
-## 8. Versioning and Change Management
+## 9. Versioning and Change Management
 
 ### Version tagging
 
@@ -462,5 +545,6 @@ A change is a **breaking change** if it:
 - Renames or removes a `config.env` variable
 - Changes the output path or format of a file that downstream phases or Phase 5 depends on
 - Changes the interface of a `lib/common.sh` function
+- **Renames or removes a step key** in `STEP_REGISTRY` (operators may have these in scripts, cron jobs, or runbook notes)
 
-Breaking changes must be documented in the commit, and `config.env.example` must be updated to reflect them. Notify anyone else who maintains a `config.env` file based on the old template.
+Breaking changes must be documented in the commit, and `config.env.example` must be updated to reflect them. For step key renames, update `STEP_REGISTRY` in `orchestrator.py`, all `skip_if_exists` / `_step_is_skipped` calls in the phase scripts, and the step table in `docs/RUNBOOK.md §9b`. Notify anyone else who maintains operator runbooks or automation that calls the orchestrator with `--skip` or `--only`.

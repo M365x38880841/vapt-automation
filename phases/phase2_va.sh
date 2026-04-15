@@ -41,7 +41,7 @@ for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
     SCOUT_REPORT_SUB="${SCOUT_REPORT_DIR}/${sub_id}"
     SCOUT_DONE_SUB="${SCOUT_REPORT_SUB}/report.html"
     mkdir -p "${SCOUT_REPORT_SUB}"
-    if ! skip_if_exists "${SCOUT_DONE_SUB}" "ScoutSuite audit for subscription ${sub_id}"; then
+    if ! skip_if_exists "${SCOUT_DONE_SUB}" "ScoutSuite audit for subscription ${sub_id}" "scoutsuite"; then
         checkpoint "Launch ScoutSuite audit against subscription ${sub_id} (tenant: ${AZURE_TENANT_ID})?"
         log INFO "Starting ScoutSuite for ${sub_id} in background (est. 25–45 min)..."
         bg_run "scoutsuite_${sub_id}" \
@@ -59,7 +59,7 @@ done
 AZ_SEC="${OUT_CLOUD}/security_checks"
 mkdir -p "${AZ_SEC}"
 
-if ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted security checks"; then
+if ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted security checks" "azure_security"; then
     log INFO "Running Azure targeted security checks in background..."
 
     bg_run "azure_sec_checks" \
@@ -129,7 +129,7 @@ fi
 AD_CHECKS="${OUT_AD}/ad_checks"
 mkdir -p "${AD_CHECKS}"
 
-if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks"; then
+if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "ad_checks"; then
     log INFO "Running Linux-based AD security checks..."
 
     # Kerberoastable accounts check (Phase 2 identification, not yet exploiting)
@@ -264,7 +264,9 @@ fi
 ZAP_OUT="${OUT_WEB}/zap"
 mkdir -p "${ZAP_OUT}"
 
-if [[ -z "${WEB_TARGETS:-}" ]]; then
+if _step_is_skipped "zap"; then
+    : # skip ZAP entirely
+elif [[ -z "${WEB_TARGETS:-}" ]]; then
     log WARN "WEB_TARGETS not set in config.env — DAST skipped. Set WEB_TARGETS to enable ZAP scans."
 else
     if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
@@ -291,7 +293,7 @@ else
             mkdir -p "${ZAP_TARGET_OUT}"
             ZAP_DONE="${ZAP_TARGET_OUT}/zap_report.html"
 
-            if skip_if_exists "${ZAP_DONE}" "ZAP ${ZAP_SCAN_MODE:-baseline} scan: ${target}"; then
+            if skip_if_exists "${ZAP_DONE}" "ZAP ${ZAP_SCAN_MODE:-baseline} scan: ${target}" "zap"; then
                 continue
             fi
 
@@ -321,7 +323,9 @@ else
 fi
 
 # ─── STEP 2.5 — NESSUS API TRIGGER (if Nessus configured) ────────────────────
-if [[ -n "${NESSUS_URL:-}" && -n "${NESSUS_USER:-}" && -n "${NESSUS_PASS:-}" ]]; then
+if _step_is_skipped "nessus"; then
+    : # skip
+elif [[ -n "${NESSUS_URL:-}" && -n "${NESSUS_USER:-}" && -n "${NESSUS_PASS:-}" ]]; then
     log INFO "Triggering Nessus scan via API..."
     NESSUS_SCAN_OUT="${OUT_NET}/nessus_scan.json"
 

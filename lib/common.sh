@@ -317,10 +317,48 @@ phase_dir() {
     echo "$dir"
 }
 
+# ─── STEP SKIP CONTROLS ───────────────────────────────────────────────────────
+# Driven by SKIP_STEPS and ONLY_STEPS env vars set by orchestrator --skip / --only.
+#
+# SKIP_STEPS="kerberoast,scoutsuite"  → run everything except those two steps
+# ONLY_STEPS="bloodhound,roadrecon"   → run only those two steps, skip all others
+#
+# _step_is_skipped "key" returns 0 (skip) or 1 (proceed).
+_step_is_skipped() {
+    local key="$1"
+    # --only mode: skip anything NOT in the list
+    if [[ -n "${ONLY_STEPS:-}" ]]; then
+        local item
+        for item in ${ONLY_STEPS//,/ }; do
+            [[ "${item// /}" == "$key" ]] && return 1  # in list → proceed
+        done
+        log INFO "Skipping (not in --only list): ${key}"
+        echo -e "${YELLOW}  [SKIP] ${key} — not in --only list${RESET}"
+        return 0  # not in list → skip
+    fi
+    # --skip mode: skip anything IN the list
+    if [[ -n "${SKIP_STEPS:-}" ]]; then
+        local item
+        for item in ${SKIP_STEPS//,/ }; do
+            [[ "${item// /}" == "$key" ]] && {
+                log INFO "Skipping (--skip): ${key}"
+                echo -e "${YELLOW}  [SKIP] ${key} — excluded via --skip${RESET}"
+                return 0  # in list → skip
+            }
+        done
+    fi
+    return 1  # proceed
+}
+
 # ─── SKIP IF OUTPUT EXISTS ────────────────────────────────────────────────────
-# Usage: skip_if_exists "filepath" "description"
+# Usage: skip_if_exists "filepath" "description" ["step_key"]
+# If step_key is supplied it is also checked against SKIP_STEPS / ONLY_STEPS.
 skip_if_exists() {
-    local filepath="$1"; local desc="$2"
+    local filepath="$1"; local desc="$2"; local key="${3:-}"
+    # Explicit skip/only check takes priority over file existence
+    if [[ -n "$key" ]] && _step_is_skipped "$key"; then
+        return 0
+    fi
     if [[ -f "$filepath" ]]; then
         log INFO "Skipping (already exists): ${desc} → ${filepath}"
         echo -e "${GREEN}  [SKIP] ${desc} — output already exists.${RESET}"
