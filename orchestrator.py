@@ -366,16 +366,93 @@ def main():
             lf.write(f"# VAPT Engagement Log — {config.get('ENGAGEMENT_NAME', 'Ha-Shem')}\n")
             lf.write(f"Started: {ts()}\n\n")
 
-    # ── Status mode
+    # ── Status mode — morning briefing
     if args.status:
-        info("Reading engagement log for phase completion markers...")
+        # Phase completion summary from engagement log
+        print(f"\n{BOLD}{'═'*62}{RESET}")
+        print(f"{BOLD}  Phase Completion Summary{RESET}")
+        print(f"{BOLD}{'═'*62}{RESET}")
         if log_file.exists():
             content = log_file.read_text()
             for num, p in PHASES.items():
-                started  = f"PHASE {num} START" in content
-                ended    = f"PHASE {num} END"   in content
-                status   = f"{G}Complete{RESET}" if ended else (f"{Y}In Progress{RESET}" if started else f"{R}Not Started{RESET}")
-                print(f"  Phase {num} ({p['name']}): {status}")
+                started = f"PHASE {num} START" in content
+                ended   = f"PHASE {num} END"   in content
+                if ended:
+                    symbol = f"{G}✔  Complete   {RESET}"
+                elif started:
+                    symbol = f"{Y}⏳ In Progress{RESET}"
+                else:
+                    symbol = f"{R}✘  Not Started{RESET}"
+                print(f"  Phase {num}  {symbol}  {p['name']}")
+        else:
+            warn("engagement_log.md not found — has the orchestrator been run yet?")
+
+        # Background job briefing from persistent .bg_jobs file
+        bg_jobs_file = output_base / ".bg_jobs"
+        print(f"\n{BOLD}{C}{'═'*62}{RESET}")
+        print(f"{BOLD}{C}  Overnight Background Job Status{RESET}")
+        print(f"{BOLD}{C}{'═'*62}{RESET}")
+
+        if not bg_jobs_file.exists():
+            print(f"  {Y}No persistent job records found (.bg_jobs does not exist).{RESET}")
+        else:
+            running: list = []
+            completed: list = []
+            seen_pids: set = set()
+
+            with open(bg_jobs_file) as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw or raw.startswith("#"):
+                        continue
+                    parts = raw.split("|", 3)
+                    if len(parts) < 3:
+                        continue
+                    pid_str, name, logfile_path = parts[0], parts[1], parts[2]
+                    started_at = parts[3] if len(parts) > 3 else "unknown"
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        continue
+                    if pid in seen_pids:
+                        continue
+                    seen_pids.add(pid)
+                    alive = False
+                    try:
+                        os.kill(pid, 0)
+                        alive = True
+                    except ProcessLookupError:
+                        alive = False
+                    except PermissionError:
+                        alive = True  # process exists, we don't own it — still running
+                    if alive:
+                        running.append((pid, name, logfile_path, started_at))
+                    else:
+                        completed.append((pid, name, logfile_path, started_at))
+
+            if not running and not completed:
+                print(f"  {Y}No jobs recorded in .bg_jobs.{RESET}")
+            else:
+                for pid, name, logfile_path, started_at in running:
+                    print(f"\n  {Y}⏳ RUNNING  {RESET} {BOLD}{name}{RESET} (PID: {pid})")
+                    print(f"     Started: {started_at}")
+                    print(f"     Log:     {logfile_path}")
+
+                for pid, name, logfile_path, started_at in completed:
+                    print(f"\n  {G}✔  COMPLETE {RESET} {BOLD}{name}{RESET} (PID: {pid})")
+                    print(f"     Started: {started_at}")
+                    lf = Path(logfile_path)
+                    if lf.exists():
+                        tail = [l for l in lf.read_text().splitlines()[-5:] if l.strip()]
+                        for line in tail:
+                            print(f"     {line}")
+
+                print(f"\n  {G}Completed overnight: {len(completed)}{RESET}   "
+                      f"{Y}Still running: {len(running)}{RESET}")
+
+        print(f"{BOLD}{C}{'═'*62}{RESET}")
+        print(f"\n  Idempotency: completed steps are skipped automatically.")
+        print(f"  Resume any unfinished phase: {BOLD}python3 orchestrator.py --phase N{RESET}\n")
         return
 
     # ── Emergency contact display

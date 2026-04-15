@@ -114,7 +114,15 @@ checkpoint() {
 }
 
 # ─── BUSINESS HOURS ENFORCEMENT ───────────────────────────────────────────────
+# Usage:
+#   check_testing_window            — active mode: prompts and may block outside hours
+#   check_testing_window --passive  — passive mode: logs but never blocks
+#                                     Use for offline/non-interactive jobs (Nmap, Hashcat,
+#                                     ScoutSuite) that can safely run overnight. The RoE
+#                                     testing window applies to active attacks, not background
+#                                     enumeration or local cracking jobs.
 check_testing_window() {
+    local mode="${1:-active}"
     [[ "${ENFORCE_TESTING_WINDOW:-false}" != "true" ]] && return 0
     local current_time; current_time=$(date '+%H:%M')
     local start="${TESTING_WINDOW_START:-09:00}"
@@ -126,6 +134,10 @@ check_testing_window() {
     start_min=$(_hm_to_min "${start}")
     end_min=$(_hm_to_min "${end}")
     if (( cur_min < start_min || cur_min > end_min )); then
+        if [[ "$mode" == "--passive" ]]; then
+            log INFO "Outside testing window (${current_time}) — passive job allowed to continue overnight"
+            return 0
+        fi
         echo -e "${RED}[SAFETY] Current time ${current_time} is outside testing window (${start}–${end}).${RESET}"
         echo -e "${YELLOW}Override? This may violate the Rules of Engagement. [y/N]:${RESET} \c"
         read -r override
@@ -135,19 +147,31 @@ check_testing_window() {
 }
 
 # ─── BACKGROUND JOB MANAGER ───────────────────────────────────────────────────
+# .bg_jobs — persistent record on disk so the next morning session can check
+# what ran overnight. Format: PID|name|logfile|started_at
+BG_JOBS_FILE="${OUTPUT_BASE_DIR:-${HOME}/vapt}/.bg_jobs"
 BG_JOB_PIDS=()
 BG_JOB_NAMES=()
 
 bg_run() {
     # Usage: bg_run "job_name" "log_file" command [args...]
+    #
+    # Session-persistence: nohup ignores SIGHUP so the job survives terminal close.
+    # disown removes it from bash's job table so bash itself won't kill it on exit.
+    # The PID is also written to BG_JOBS_FILE on disk — the next morning session
+    # can read this file and check which jobs finished overnight.
     local name="$1"; local logfile="$2"; shift 2
     log_cmd "$*"
-    "$@" >> "${logfile}" 2>&1 &
+    nohup "$@" >> "${logfile}" 2>&1 &
     local pid=$!
+    disown "$pid"
     BG_JOB_PIDS+=("$pid")
     BG_JOB_NAMES+=("$name")
+    # Persist to disk — survives terminal close
+    echo "${pid}|${name}|${logfile}|$(date '+%Y-%m-%d %H:%M:%S')" >> "${BG_JOBS_FILE}"
     log INFO "Background job started: ${name} (PID: ${pid}) → ${logfile}"
-    echo -e "${GREEN}  [BG] ${name} started (PID: ${pid})${RESET}"
+    echo -e "${GREEN}  [BG] ${name} started (PID: ${pid}) — persisted to ${BG_JOBS_FILE}${RESET}"
+    echo -e "${CYAN}       Safe to close terminal — job runs overnight via nohup${RESET}"
 }
 
 wait_for_bg_jobs() {
@@ -158,10 +182,10 @@ wait_for_bg_jobs() {
         local name="${BG_JOB_NAMES[$i]}"
         if kill -0 "$pid" 2>/dev/null; then
             echo -e "  ${YELLOW}⏳ Waiting for: ${name} (PID: ${pid})${RESET}"
-            wait "$pid"
-            local rc=$?
-            [[ $rc -eq 0 ]] && log OK "${name} completed successfully" \
-                            || log WARN "${name} exited with code ${rc}"
+            wait "$pid" 2>/dev/null || true  # disowned jobs may not be waitable
+            log OK "${name} completed"
+        else
+            log OK "${name} already finished (PID: ${pid})"
         fi
     done
     BG_JOB_PIDS=(); BG_JOB_NAMES=()
@@ -169,16 +193,67 @@ wait_for_bg_jobs() {
 }
 
 status_bg_jobs() {
-    echo -e "\n${CYAN}Background Job Status:${RESET}"
+    echo -e "\n${CYAN}Background Job Status (in-session):${RESET}"
+    if [[ ${#BG_JOB_PIDS[@]} -eq 0 ]]; then
+        echo -e "  No jobs tracked in this session."
+        return
+    fi
     for i in "${!BG_JOB_PIDS[@]}"; do
         local pid="${BG_JOB_PIDS[$i]}"
         local name="${BG_JOB_NAMES[$i]}"
         if kill -0 "$pid" 2>/dev/null; then
             echo -e "  ${YELLOW}⏳ Running:  ${name} (PID: ${pid})${RESET}"
         else
-            echo -e "  ${GREEN}✅ Done:     ${name} (PID: ${pid})${RESET}"
+            echo -e "  ${GREEN}✔  Done:     ${name} (PID: ${pid})${RESET}"
         fi
     done
+}
+
+# morning_briefing — reads the persistent .bg_jobs file and reports overnight status.
+# Run this at the start of the next day's session to see what finished overnight.
+# Usage: morning_briefing
+morning_briefing() {
+    echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}${CYAN}  Morning Briefing — Overnight Background Job Status${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
+
+    if [[ ! -f "${BG_JOBS_FILE}" ]]; then
+        echo -e "  ${YELLOW}No persistent job records found (${BG_JOBS_FILE} does not exist).${RESET}"
+        echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}\n"
+        return
+    fi
+
+    local running=0 done_count=0 seen_pids=()
+    while IFS='|' read -r pid name logfile started_at; do
+        [[ -z "$pid" || "$pid" =~ ^# ]] && continue
+        # Deduplicate — if the same PID appears twice (phase re-run), show once
+        local already_seen=false
+        for s in "${seen_pids[@]:-}"; do [[ "$s" == "$pid" ]] && already_seen=true && break; done
+        $already_seen && continue
+        seen_pids+=("$pid")
+
+        if kill -0 "$pid" 2>/dev/null; then
+            echo -e "  ${YELLOW}⏳ STILL RUNNING${RESET}  ${BOLD}${name}${RESET} (PID: ${pid})"
+            echo -e "     Started:  ${started_at}"
+            echo -e "     Log:      ${logfile}"
+            (( running++ )) || true
+        else
+            echo -e "  ${GREEN}✔  COMPLETED${RESET}    ${BOLD}${name}${RESET} (PID: ${pid})"
+            echo -e "     Started:  ${started_at}"
+            if [[ -f "${logfile}" ]]; then
+                local tail_lines
+                tail_lines=$(tail -3 "${logfile}" 2>/dev/null | grep -v '^$' | sed 's/^/             /')
+                [[ -n "$tail_lines" ]] && echo -e "${tail_lines}"
+            fi
+            (( done_count++ )) || true
+        fi
+        echo ""
+    done < "${BG_JOBS_FILE}"
+
+    echo -e "  ${GREEN}Completed overnight: ${done_count}${RESET}   ${YELLOW}Still running: ${running}${RESET}"
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
+    echo -e "  To re-run any failed phase: ${BOLD}python3 orchestrator.py --phase N${RESET}"
+    echo -e "  Idempotency: completed steps are skipped automatically.\n"
 }
 
 # ─── NOTIFICATION ─────────────────────────────────────────────────────────────

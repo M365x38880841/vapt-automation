@@ -333,32 +333,152 @@ python3 orchestrator.py --phase 5
 
 ## 9. Background Job Monitoring Reference
 
-| Job | Log file | Check command | Done signal |
-|-----|----------|--------------|-------------|
-| Nmap full scan | `phase1/network/fullscan.log` | `tail -f <log>` | `fullscan.xml` appears |
-| BloodHound collect | `phase1/ad/bloodhound_collect.log` | `tail -f <log>` | `*.zip` in `phase1/ad/bloodhound/` |
-| ROADrecon | `phase1/cloud/roadrecon.log` | `tail -f <log>` | `roadrecon.db` > 0 bytes |
-| Azure inventory | `phase1/cloud/azure_inventory.log` | `tail -f <log>` | `azure_inventory.json` appears |
-| ScoutSuite (per sub) | `phase2/cloud/scoutsuite_<sub>.log` | `tail -f <log>` | `scoutsuite/<sub>/report.html` appears |
-| ZAP (per target) | `phase2/web/zap/<target>/zap.log` | `tail -f <log>` | `zap_report.html` appears |
-| Responder | `/usr/share/responder/logs/` | `watch -n 30 'ls ... \| wc -l'` | Captures appear in logs dir |
-| Hashcat NTLMv2 | `phase3/ad/hashcat_ntlm.log` | `tail -f <log>` | `cracked_ntlm.txt` populated |
-| Hashcat TGS | `phase3/ad/hashcat_tgs.log` | `tail -f <log>` | `cracked_tgs.txt` populated |
+| Job | Log file | Check command | Done signal | Overnight safe? |
+|-----|----------|--------------|-------------|-----------------|
+| Nmap full scan | `phase1/network/fullscan.log` | `tail -f <log>` | `fullscan.xml` appears | **Yes** — passive, offline |
+| BloodHound collect | `phase1/ad/bloodhound_collect.log` | `tail -f <log>` | `*.zip` in `phase1/ad/bloodhound/` | **Yes** — one-shot LDAP query |
+| ROADrecon | `phase1/cloud/roadrecon.log` | `tail -f <log>` | `roadrecon.db` > 0 bytes | **Yes** — API query |
+| Azure inventory | `phase1/cloud/azure_inventory.log` | `tail -f <log>` | `azure_inventory.json` appears | **Yes** — API query |
+| ScoutSuite (per sub) | `phase2/cloud/scoutsuite_<sub>.log` | `tail -f <log>` | `scoutsuite/<sub>/report.html` appears | **Yes** — read-only Azure API |
+| ZAP (per target) | `phase2/web/zap/<target>/zap.log` | `tail -f <log>` | `zap_report.html` appears | Baseline: **Yes** — Full scan: No |
+| Responder | `/usr/share/responder/logs/` | `watch -n 30 'ls ... \| wc -l'` | Captures appear in logs dir | **No — must stop at 17:00** |
+| Hashcat NTLMv2 | `phase3/ad/hashcat_ntlm.log` | `tail -f <log>` | `cracked_ntlm.txt` populated | **Yes** — local CPU/GPU only |
+| Hashcat TGS | `phase3/ad/hashcat_tgs.log` | `tail -f <log>` | `cracked_tgs.txt` populated | **Yes** — local CPU/GPU only |
+
+> **Rule:** Jobs with no outbound network traffic (Hashcat) or read-only API queries (ScoutSuite, Azure inventory, Nmap) are overnight-safe. Active network poisoning (Responder) is **not** overnight-safe and will auto-stop via `atd` scheduling.
+
+---
+
+## 9a. Overnight Workflow — Keeping Jobs Running After Terminal Close
+
+### Why jobs survive terminal close
+
+All background jobs are launched with `nohup` + `disown` (in `bg_run()` in `lib/common.sh`). This means:
+
+- **`nohup`** — the process ignores SIGHUP. When the terminal closes, the kernel sends SIGHUP to all attached processes. `nohup` blocks this signal, so the job keeps running.
+- **`disown`** — removes the job from bash's job table. Bash would otherwise send SIGHUP to all its job-table entries when it exits.
+
+The PID of every background job is also written to `${OUTPUT_BASE_DIR}/.bg_jobs` so the next session can check which jobs finished overnight.
+
+### Standard end-of-day procedure (tmux recommended)
+
+tmux is the recommended way to manage the attack session. It provides a persistent terminal session that jobs can be checked on from any SSH client. If the machine is local (no SSH), the `nohup`/`disown` approach alone is sufficient.
+
+```bash
+# ── Start of day: start a named tmux session
+tmux new-session -d -s vapt
+tmux attach -t vapt
+
+# ── Run phases inside tmux
+python3 orchestrator.py --phase 1
+
+# ── End of day: detach cleanly (Ctrl+B, then D)
+# The session keeps running. All bg jobs continue via nohup.
+# The terminal can be closed or the SSH session can drop — jobs survive.
+
+# ── Next morning: reattach to check live status
+tmux attach -t vapt
+# or, if you just want the morning briefing without re-attaching:
+python3 orchestrator.py --status
+```
+
+### Morning briefing command
+
+```bash
+# See which overnight jobs completed and which are still running:
+python3 orchestrator.py --status
+```
+
+The `--status` output shows:
+
+```
+════════════════════════════════════════════════════════════════
+  Phase Completion Summary
+════════════════════════════════════════════════════════════════
+  Phase 0  ✔  Complete    Pre-Engagement Setup
+  Phase 1  ⏳ In Progress  Reconnaissance & Discovery
+  Phase 2  ✘  Not Started  Vulnerability Assessment
+...
+════════════════════════════════════════════════════════════════
+  Overnight Background Job Status
+════════════════════════════════════════════════════════════════
+
+  ✔  COMPLETE   nmap_fullscan (PID: 12345)
+     Started: 2026-04-08 09:05:12
+     Nmap done: 4 IP address (4 hosts up) scanned
+
+  ⏳ RUNNING    scoutsuite_abc123def456 (PID: 13201)
+     Started: 2026-04-08 09:07:44
+     Log:     /home/.../phase2/cloud/scoutsuite_abc123def456.log
+...
+  Completed overnight: 3   Still running: 1
+════════════════════════════════════════════════════════════════
+  Resume any unfinished phase: python3 orchestrator.py --phase N
+```
+
+### Resuming interrupted phases
+
+The framework is idempotent. Every step uses `skip_if_exists()` to check whether its output file already exists before running. Re-running a phase picks up from where it left off — completed steps are skipped automatically.
+
+```bash
+# Phase 1 ran overnight. Nmap finished. BloodHound was interrupted.
+# Re-running phase 1 skips nmap (fullscan.xml exists) and resumes BloodHound.
+python3 orchestrator.py --phase 1
+```
+
+### Responder auto-stop
+
+Responder is the exception: it is an active network poisoner and **must stop at 17:00** per the RoE testing window. The framework schedules an automatic kill via `atd` when Responder starts:
+
+```bash
+# Scheduled automatically — no manual step required:
+echo "sudo pkill -f 'responder.*-I.*eth0'" | at 17:00
+
+# Verify the job is queued:
+atq
+
+# If atd is not available on your Kali install:
+sudo systemctl enable atd --now
+```
+
+If `atd` is unavailable, Phase 3 logs a warning with the manual kill command. Check the log:
+
+```bash
+grep 'auto-stop\|REMINDER\|Responder' "${OUTPUT_BASE_DIR}/engagement_log.md"
+```
+
+### Re-running a passive job outside business hours
+
+If you need to restart an overnight-safe job (e.g. Nmap was interrupted) after 17:00:
+
+```bash
+# Option 1: disable the window check temporarily
+# Edit config.env: set ENFORCE_TESTING_WINDOW=false
+# Then re-run the phase — the passive job restarts, skip_if_exists handles the rest
+python3 orchestrator.py --phase 1
+
+# Option 2: run the phase script directly (bypasses orchestrator window gate)
+export $(cat config.env | grep -v '^#' | xargs)
+bash phases/phase1_discovery.sh
+```
+
+---
 
 **Recommended daily schedule:**
 
 | Time | Action |
 |------|--------|
-| 08:50 | Start attack machine, verify Azure login (`az account show`) |
+| 08:50 | `python3 orchestrator.py --status` — morning briefing, see overnight results |
 | 08:55 | Start BloodHound CE if not running: `docker compose -f tools/bloodhound-ce/docker-compose.yml up -d` |
-| 09:00 | `python3 orchestrator.py --phase <today>` |
-| 09:05 | Background jobs start (Nmap, ScoutSuite, Responder, Hashcat, ZAP) |
+| 09:00 | Resume or continue: `python3 orchestrator.py --phase <today>` |
+| 09:05 | Background jobs start / resume (Nmap, ScoutSuite, Responder, Hashcat, ZAP) |
 | 09:10–12:00 | Active work: BloodHound analysis, Burp testing, manual AD checks |
 | 12:00 | Check background job status; review any cracked hashes |
 | 13:00–16:30 | Active exploitation / lateral movement (with operator gates) |
-| 16:30 | Start overnight background jobs (confirm Nmap, Hashcat still running) |
-| 16:55 | Log work in `engagement_log.md`; confirm background jobs running |
-| 17:00 | Leave overnight jobs running; check logs tomorrow |
+| 16:30 | Confirm overnight-safe jobs are running (Nmap, Hashcat, ScoutSuite) |
+| 16:55 | Verify Responder `atq` shows stop job queued; log work in `engagement_log.md` |
+| 17:00 | Detach tmux (`Ctrl+B, D`) or close terminal — overnight jobs continue via nohup |
+| 08:50 +1 | `python3 orchestrator.py --status` — check what completed |
 
 ---
 
