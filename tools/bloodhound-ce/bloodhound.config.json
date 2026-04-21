@@ -6,11 +6,12 @@
   "database": {
     "connection": "user=bloodhound password=bloodhoundcommunityedition dbname=bloodhound host=app-db"
   },
-  "graph_driver": {
-    "neo4j_connection": "bolt://graph-db:7687"
+  "graph_driver": "neo4j",
+  "neo4j": {
+    "neo4j_connection": "bolt://graph-db:7687",
+    "neo4j_user": "neo4j",
+    "neo4j_secret": "bloodhoundcommunityedition"
   },
-  "collectors_base_path": "/etc/bloodhound/collectors/",
-  "enable_start_collection_task": false,
   "crypto": {
     "jwt": {
       "signing_key": "vapt-bhce-replace-with-random-32char-string"
