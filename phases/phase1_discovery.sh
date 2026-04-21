@@ -33,7 +33,7 @@ if _step_is_skipped "host_sweep"; then
     for subnet in ${TARGET_SUBNETS}; do
         safe_name="${subnet//\//_}"
         gnmap="${OUT_NET}/hostsweep_${safe_name}.gnmap"
-        [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}" || true
+        { [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}"; } || true
     done
     sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}" 2>/dev/null || true
     LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}" 2>/dev/null || echo 0)
@@ -62,10 +62,13 @@ wait_for_bg_jobs "host sweeps"
 for subnet in ${TARGET_SUBNETS}; do
     safe_name="${subnet//\//_}"
     gnmap="${OUT_NET}/hostsweep_${safe_name}.gnmap"
-    [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}"
+    # || true: grep exits 1 when no 'Up' lines exist (empty subnet / ICMP blocked).
+    # Without this, set -euo pipefail kills the script before we reach the explicit
+    # "no live hosts" error message on the line below.
+    [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}" || true
 done
-sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}"
-LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}")
+sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}" 2>/dev/null || true
+LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}" 2>/dev/null || echo 0)
 log OK "Host sweep complete. Live hosts found: ${LIVE_COUNT} → ${LIVE_HOSTS_MERGED}"
 
 fi  # end host_sweep skip gate
@@ -124,11 +127,12 @@ if ! skip_if_exists "${LDAP_USERS_OUT}" "LDAP user enumeration" "ldap_users"; th
         '(objectClass=user)' sAMAccountName mail memberOf userAccountControl \
         2>&1 > "${LDAP_USERS_OUT}" || log WARN "LDAP query failed — check credentials and DC reachability"
 
-    # Extract clean username list for Phase 3 (AS-REP roasting)
+    # Extract clean username list for Phase 3 (AS-REP roasting).
+    # || true: grep exits 1 when ldapsearch returned nothing (auth failure, empty OU).
     grep 'sAMAccountName:' "${LDAP_USERS_OUT}" | awk '{print $2}' \
         | grep -v -E '^\$' \
-        > "${OUT_AD}/userlist.txt"
-    UCOUNT=$(wc -l < "${OUT_AD}/userlist.txt")
+        > "${OUT_AD}/userlist.txt" || true
+    UCOUNT=$(wc -l < "${OUT_AD}/userlist.txt" 2>/dev/null || echo 0)
     log OK "LDAP users collected: ${UCOUNT} accounts → ${OUT_AD}/userlist.txt"
 fi
 
