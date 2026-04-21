@@ -309,6 +309,18 @@ if [[ ! -f "${BHCE_CONFIG}" ]]; then
     exit 1
 fi
 
+# ── JWT signing key: replace placeholder before first start ─────────────────
+# The config ships with a placeholder key. BloodHound CE will start with it but
+# tokens signed by a known/public key are a security risk — generate a real one.
+PLACEHOLDER="vapt-bhce-replace-with-random-32char-string"
+if grep -q "${PLACEHOLDER}" "${BHCE_CONFIG}" 2>/dev/null; then
+    log WARN "BloodHound CE config contains placeholder JWT signing key — generating secure key..."
+    NEW_KEY=$(openssl rand -hex 32)
+    # Replace both occurrences (jwt_signing_key top-level + crypto.jwt.signing_key)
+    sed -i "s/${PLACEHOLDER}/${NEW_KEY}/g" "${BHCE_CONFIG}"
+    log OK "JWT signing key set (${#NEW_KEY}-char hex). Keep ${BHCE_CONFIG} private."
+fi
+
 # Check if stack is already running (covers both fresh start and resume after reboot)
 if docker compose -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy'; then
     log OK "BloodHound CE stack already running → http://localhost:8080"
@@ -316,13 +328,29 @@ else
     checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"
     log INFO "Pulling and starting BloodHound CE stack (first run downloads ~1.5 GB, may take 3–5 min)..."
     docker compose -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
-    log INFO "Waiting for BloodHound CE health checks (up to 90s)..."
-    local_wait=0
-    until docker compose -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'healthy|running' \
-          || [[ $local_wait -ge 90 ]]; do
-        sleep 5; (( local_wait += 5 ))
+
+    # ── Wait for BloodHound HTTP endpoint — not just container status ─────────
+    # Container status (healthy/running) reflects Postgres/Neo4j readiness, but
+    # BloodHound itself still needs a few seconds after its deps are healthy.
+    # We poll the /api/version endpoint (returns 200 when the app is serving).
+    log INFO "Waiting for BloodHound CE HTTP endpoint (up to 180s)..."
+    bh_wait=0
+    bh_ready=false
+    while [[ $bh_wait -lt 180 ]]; do
+        if curl -sf --max-time 3 "http://localhost:8080/api/version" &>/dev/null; then
+            bh_ready=true
+            break
+        fi
+        sleep 5; (( bh_wait += 5 ))
+        [[ $(( bh_wait % 30 )) -eq 0 ]] && log INFO "  Still waiting... (${bh_wait}s elapsed)"
     done
-    log OK "BloodHound CE stack started → http://localhost:8080"
+
+    if $bh_ready; then
+        log OK "BloodHound CE is serving → http://localhost:8080 (${bh_wait}s)"
+    else
+        log WARN "BloodHound CE did not respond within 180s. Check container logs:"
+        log WARN "  docker compose -f ${BHCE_COMPOSE} logs bloodhound | tail -30"
+    fi
     log INFO "Get first-run admin password:"
     log INFO "  docker compose -f ${BHCE_COMPOSE} logs bloodhound 2>&1 | grep -i 'initial password\|password'"
 fi

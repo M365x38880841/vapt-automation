@@ -3,7 +3,6 @@
 # Usage: docker compose up -d
 # Web UI: http://localhost:8080  (default creds: admin / [generated on first run])
 # ============================================================================
-version: '3'
 
 services:
   bloodhound:
@@ -26,7 +25,7 @@ services:
     environment:
       POSTGRES_USER: bloodhound
       POSTGRES_PASSWORD: bloodhoundcommunityedition
-      POSTGRES_DATABASE: bloodhound
+      POSTGRES_DB: bloodhound
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
@@ -36,7 +35,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 30s
+      start_period: 60s
     restart: unless-stopped
 
   graph-db:
@@ -52,8 +51,8 @@ services:
       test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      start_period: 90s
     restart: unless-stopped
 
 volumes:

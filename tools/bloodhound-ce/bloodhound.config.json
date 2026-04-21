@@ -1,7 +1,6 @@
 {
   "version": 1,
   "bind_addr": "0.0.0.0:8080",
-  "rpc_port": 1443,
   "jwt_signing_key": "vapt-bhce-replace-with-random-32char-string",
   "database": {
     "connection": "user=bloodhound password=bloodhoundcommunityedition dbname=bloodhound host=app-db"
