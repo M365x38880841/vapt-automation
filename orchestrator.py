@@ -266,6 +266,12 @@ def load_config(config_path: str) -> dict:
                 # Strip inline comments — only strip when # is preceded by whitespace,
                 # so URLs containing # (e.g. Slack webhooks) are preserved.
                 v = re.sub(r'\s+#.*$', '', v).strip().strip('"').strip("'")
+                # Expand shell variables (${HOME}, $USER, ~) so values like
+                # OUTPUT_BASE_DIR="${HOME}/vapt" resolve to real paths.
+                # Python's config loader doesn't run through a shell, so we
+                # must expand manually; otherwise bash receives a literal "$"
+                # and won't re-expand it inside an already-set env var.
+                v = os.path.expandvars(os.path.expanduser(v))
                 config[k.strip()] = v
     return config
 
