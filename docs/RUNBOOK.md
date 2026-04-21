@@ -120,13 +120,13 @@ Phase 0 Complete — Automated Checks Passed
 
 ## 4. Phase 1 — Reconnaissance and Discovery
 
-**Goal:** Map live hosts, enumerate AD users and structure, collect BloodHound data, enumerate Entra ID and Azure resources. Background jobs will run for 3–5 hours.
+**Goal:** Map live hosts accurately, enumerate AD users and structure, collect BloodHound data, enumerate Entra ID and Azure resources.
 
 **Run:**
 ```bash
 python3 orchestrator.py --phase 1
 
-# Skip the overnight Nmap scan (e.g. already running from yesterday)
+# Skip full-port scan (already running from a previous session)
 python3 orchestrator.py --phase 1 --skip nmap_fullscan
 
 # Run only BloodHound and ROADrecon (skip network scanning entirely)
@@ -137,45 +137,43 @@ python3 orchestrator.py --phase 1 --list-steps
 ```
 
 **What happens automatically:**
-1. `host_sweep` — Host sweep across all `TARGET_SUBNETS` (parallel, one Nmap `-sn` per subnet)
-2. `nmap_fullscan` — Full port scan launched as background job against live hosts (runs overnight)
-3. `smb_sweep` — CrackMapExec SMB sweep — signing, shares, SMB signing status
-4. `ldap_banner` — LDAP rootdse banner grab
+1. `host_sweep` — TCP SYN sweep across all `TARGET_SUBNETS` (parallel, one nmap per subnet). Uses `NMAP_DISCOVERY_PORTS` — **no ICMP or ARP** — to avoid false positives from network infrastructure. Hosts with no open ports on the discovery port list are not included in the live host list.
+2. `nmap_fullscan` — Full port scan (`-p-`) split across `SYS_VCPUS` parallel nmap jobs for maximum throughput. A merge-watcher job auto-consolidates chunk results into `fullscan.gnmap` when all chunks finish.
+3. `smb_sweep` — CrackMapExec SMB sweep — signing status, host enumeration
+4. `ldap_banner` — LDAP rootDSE banner grab from DC
 5. `ldap_users` — LDAP user enumeration → `userlist.txt`
 6. `null_session` — SMB null session check
-7. `bloodhound` — BloodHound data collection (`-c All`) as background job
+7. `bloodhound` — BloodHound data collection (`-c All`, `BH_WORKERS` parallel workers) as background job
 8. `roadrecon` — ROADrecon Entra ID gather (background if password auth; foreground if device code)
-9. `azure_inventory` — Azure resource inventory across all subscriptions (per-subscription JSON files merged)
+9. `azure_inventory` — Azure resource inventory across all subscriptions (per-subscription JSON files, merged with `jq`)
+10. _(optional)_ `host_sweep` step 10 — **Password spray** if `SPRAY_ENABLED=true`. Guarded against lockout: checks `SPRAY_MAX_ATTEMPTS` against the domain lockout threshold from Phase 2 output.
 
-**Operator actions during Phase 1:**
-- Confirm the full port scan checkpoint (it will run overnight — confirm before EOD)
-- While background jobs run, begin manual BloodHound analysis prep
-- At EOD: verify background jobs are still running:
-  ```bash
-  python3 orchestrator.py --status
-  tail -f ~/vapt/phase1/network/fullscan.log
-  ```
+**Before confirming the full-port scan checkpoint:**
+- Verify `live_hosts_all.txt` count is realistic for the network size
+- If the count looks inflated, populate `SCAN_EXCLUDE_RANGES` in `config.env` with known infrastructure IPs and re-run `host_sweep`
 
-**Next morning (before Phase 2):**
-1. Check full scan completed: `ls -lh ~/vapt/phase1/network/fullscan.xml`
-2. Check BloodHound ZIP exists: `ls ~/vapt/phase1/ad/bloodhound/*.zip`
+**After background jobs complete:**
+1. Check merge complete: `ls -lh ~/vapt/phase1/network/fullscan.gnmap`
+2. Check BloodHound ZIP: `ls ~/vapt/phase1/ad/bloodhound/*.zip`
 3. Import BloodHound ZIP into UI at http://localhost:8080
-4. Run key BloodHound queries (see playbook):
+4. Run key BloodHound queries:
    - Shortest path to Domain Admins
    - All Kerberoastable users
    - Users with DCSync rights
    - Computers with unconstrained delegation
 5. Check ROADrecon DB: `ls -lh ~/vapt/phase1/cloud/roadrecon.db`
-   - If empty or missing: ROADrecon auth failed — re-run with `ROADRECON_AUTH_METHOD=devicecode`
+   - If empty/small (<50KB): set `ROADRECON_AUTH_METHOD=devicecode` and re-run Phase 1
 6. Review relay targets: `cat ~/vapt/phase1/ad/relay_target_ips.txt`
 
 **Key output files:**
 | File | What to look for |
 |------|-----------------|
-| `phase1/network/live_hosts_all.txt` | Total count; unexpected ranges |
-| `phase1/network/fullscan.xml` | Open ports, service versions, script output |
-| `phase1/ad/userlist.txt` | Total user count; service accounts |
-| `phase1/ad/relay_target_ips.txt` | Non-empty = NTLM relay is viable in Phase 3 |
+| `phase1/network/live_hosts_all.txt` | Total count; should reflect real workstations/servers only |
+| `phase1/network/fullscan.gnmap` | Open ports, service versions; assembled from parallel chunks |
+| `phase1/network/nmap_merge.log` | Merge watcher progress; `MERGE COMPLETE` line confirms done |
+| `phase1/ad/userlist.txt` | Total user count; service accounts (targets for Kerberoasting) |
+| `phase1/ad/relay_target_ips.txt` | Non-empty = NTLM relay viable in Phase 3 |
+| `phase1/ad/spray_results.txt` | Created only if `SPRAY_ENABLED=true` |
 | `phase1/cloud/azure_inventory.json` | Resource count; unexpected resource types |
 
 ---
@@ -203,13 +201,14 @@ python3 orchestrator.py --phase 2 --list-steps
 2. `azure_security` — Azure targeted security checks: public blob access, NSG any-inbound rules, Key Vault policies, over-privileged role assignments, storage HTTPS enforcement, Conditional Access policies
 3. `ad_checks` — AD security checks: Kerberoastable accounts, AS-REP roastable accounts, password policy, accessible shares, Domain Admins group, unconstrained delegation, password-never-expires accounts; **AD CS certipy** ESC1–ESC8; **SMB vuln modules** ms17-010, nopac, petitpotam
 4. `zap` — OWASP ZAP DAST: baseline (passive) or full (active) web scan per URL in `WEB_TARGETS`
-5. `nessus` — Nessus API trigger (if configured)
+5. `nessus` — Nessus API trigger: authenticates, launches the pre-configured scan (`NESSUS_SCAN_ID` via `POST /scans/{ID}/launch`), saves the scan UUID to `nessus_scan_uuid.txt`, then deletes the session token. If `NESSUS_SCAN_ID` is not set, prompts the operator to launch manually.
 
 **Operator actions during Phase 2:**
 - Confirm ScoutSuite audit checkpoints
 - While background jobs run:
   - Review BloodHound analysis from Phase 1
-  - Launch Nessus/OpenVAS credentialed scan via UI (start at beginning of Phase 2 day)
+  - If Nessus was launched automatically, monitor scan progress in the Nessus UI
+  - If Nessus was not configured, launch manually via the UI at `NESSUS_URL`
   - Begin Burp Suite manual testing of in-scope web apps
   - Run PingCastle from a Windows domain-joined machine
 - Monitor ZAP scans: `tail -f ~/vapt/phase2/web/zap/<target>/zap.log`
@@ -240,10 +239,10 @@ python3 orchestrator.py --phase 2 --list-steps
 ```bash
 python3 orchestrator.py --phase 3
 
-# Responder already running from earlier — skip it, run kerberoast + hashcat only
+# Responder already running from an earlier session — skip it
 python3 orchestrator.py --phase 3 --skip responder --only kerberoast,asrep,hashcat
 
-# Hashes cracked overnight — run only PtH sweep
+# Hashes cracked — run only PtH sweep (provide hash at OBTAINED_HASH prompt)
 python3 orchestrator.py --phase 3 --only pth_sweep
 
 # See all step keys for this phase
@@ -254,9 +253,9 @@ python3 orchestrator.py --phase 3 --list-steps
 1. Responder started (background, runs for `RESPONDER_DURATION` seconds)
 2. Kerberoasting — TGS ticket request for all Kerberoastable accounts
 3. AS-REP Roasting — AS-REP hash request for pre-auth disabled accounts
-4. `hashcat` — Hashcat NTLMv2 cracking (3 background jobs: rockyou, rules, corporate patterns)
-5. `hashcat` — Hashcat TGS cracking (if tickets obtained)
-6. `hashcat` — Hashcat AS-REP cracking (if hashes obtained)
+4. `hashcat` — Hashcat NTLMv2 cracking: 3 parallel background jobs (rockyou, rockyou+rules, corporate patterns), each writing to its own output file. Results merged into `cracked_ntlm.txt`. Jobs use `-w ${HC_WORKLOAD} --optimized-kernel-enable` tuned to detected vCPU count.
+5. `hashcat` — Hashcat TGS cracking (if Kerberoast tickets obtained)
+6. `hashcat` — Hashcat AS-REP cracking (if AS-REP hashes obtained)
 7. `ntlm_relay` — NTLM relay setup (if relay targets exist) — requires operator target confirmation
 8. `pth_sweep` — Pass-the-Hash sweep (if `OBTAINED_HASH` was provided at prompt)
 9. `azure_storage` — Azure public storage container access check (PoC)
@@ -275,11 +274,15 @@ python3 orchestrator.py --phase 3 --list-steps
 
 **Monitoring cracking jobs:**
 ```bash
-# Check cracked NTLM hashes
-tail -f ~/vapt/phase3/ad/hashcat_ntlm.log
+# Per-wordlist progress logs
+tail -f ~/vapt/phase3/ad/hashcat_ntlm.log          # rockyou job
+tail -f ~/vapt/phase3/ad/hashcat_ntlm_rules.log    # rules job
+tail -f ~/vapt/phase3/ad/hashcat_ntlm_corporate.log # corporate patterns job
+
+# Merged results (auto-updated as jobs complete)
 cat ~/vapt/phase3/ad/cracked_ntlm.txt
 
-# Check Kerberoast cracking
+# Kerberoast and AS-REP
 tail -f ~/vapt/phase3/ad/hashcat_tgs.log
 cat ~/vapt/phase3/ad/cracked_tgs.txt
 ```
@@ -336,9 +339,10 @@ python3 orchestrator.py --phase 5
 ```
 
 **What happens automatically:**
-- Evidence files copied from all phases into `~/vapt/report/evidence/`
-- Finding counts pre-populated (cracked hashes, PtH hosts, delegation issues, AD CS hits, ZAP alerts, etc.)
-- Report scaffold generated at `~/vapt/report/TECHNICAL_REPORT_SCAFFOLD.md`
+1. Evidence files copied from all phases into `~/vapt/report/evidence/{network,ad,cloud,web,cracked}/`
+2. Finding counts pre-populated in the scaffold (cracked hashes, PtH hosts, delegation issues, AD CS hits, ZAP alerts, SMB vuln hits, etc.)
+3. Report scaffold generated: `~/vapt/report/TECHNICAL_REPORT_SCAFFOLD.md`
+4. SHA-256 integrity manifest generated: `~/vapt/report/evidence_manifest.sha256` — checksums every evidence file for chain-of-custody
 
 **Operator actions (all manual):**
 1. Open `TECHNICAL_REPORT_SCAFFOLD.md` and complete every `[COMPLETE MANUALLY]` section
@@ -367,19 +371,20 @@ python3 orchestrator.py --phase 5
 
 ## 9. Background Job Monitoring Reference
 
-| Job | Log file | Check command | Done signal | Overnight safe? |
-|-----|----------|--------------|-------------|-----------------|
-| Nmap full scan | `phase1/network/fullscan.log` | `tail -f <log>` | `fullscan.xml` appears | **Yes** — passive, offline |
-| BloodHound collect | `phase1/ad/bloodhound_collect.log` | `tail -f <log>` | `*.zip` in `phase1/ad/bloodhound/` | **Yes** — one-shot LDAP query |
-| ROADrecon | `phase1/cloud/roadrecon.log` | `tail -f <log>` | `roadrecon.db` > 0 bytes | **Yes** — API query |
-| Azure inventory | `phase1/cloud/azure_inventory.log` | `tail -f <log>` | `azure_inventory.json` appears | **Yes** — API query |
-| ScoutSuite (per sub) | `phase2/cloud/scoutsuite_<sub>.log` | `tail -f <log>` | `scoutsuite/<sub>/report.html` appears | **Yes** — read-only Azure API |
-| ZAP (per target) | `phase2/web/zap/<target>/zap.log` | `tail -f <log>` | `zap_report.html` appears | Baseline: **Yes** — Full scan: No |
-| Responder | `/usr/share/responder/logs/` | `watch -n 30 'ls ... \| wc -l'` | Captures appear in logs dir | **No — must stop at 17:00** |
-| Hashcat NTLMv2 | `phase3/ad/hashcat_ntlm.log` | `tail -f <log>` | `cracked_ntlm.txt` populated | **Yes** — local CPU/GPU only |
-| Hashcat TGS | `phase3/ad/hashcat_tgs.log` | `tail -f <log>` | `cracked_tgs.txt` populated | **Yes** — local CPU/GPU only |
+| Job | Log file | Check command | Done signal |
+|-----|----------|--------------|-------------|
+| Nmap chunk scans (×vCPUs) | `phase1/network/scan_chunks/fullscan_chunk_<id>.log` | `tail -f <log>` | Per-chunk `.xml` files appear |
+| Nmap merge watcher | `phase1/network/nmap_merge.log` | `tail -f <log>` | `MERGE COMPLETE` line; `fullscan.gnmap` appears |
+| BloodHound collect | `phase1/ad/bloodhound_collect.log` | `tail -f <log>` | `*.zip` in `phase1/ad/bloodhound/` |
+| ROADrecon | `phase1/cloud/roadrecon.log` | `tail -f <log>` | `roadrecon.db` > 50KB |
+| Azure inventory | `phase1/cloud/azure_inventory.log` | `tail -f <log>` | `azure_inventory.json` appears |
+| ScoutSuite (per sub) | `phase2/cloud/scoutsuite_<sub>.log` | `tail -f <log>` | `scoutsuite/<sub>/report.html` appears |
+| ZAP (per target) | `phase2/web/zap/<target>/zap.log` | `tail -f <log>` | `zap_report.html` appears |
+| Responder | `/usr/share/responder/logs/` | `watch -n 30 'ls ...NTLMv2*.txt \| wc -l'` | Capture files appear — **stop at `TESTING_WINDOW_END`** |
+| Hashcat NTLMv2 (×3 jobs) | `phase3/ad/hashcat_ntlm*.log` | `tail -f <log>` | `cracked_ntlm_*.txt` populated; merged into `cracked_ntlm.txt` |
+| Hashcat TGS | `phase3/ad/hashcat_tgs.log` | `tail -f <log>` | `cracked_tgs.txt` populated |
 
-> **Rule:** Jobs with no outbound network traffic (Hashcat) or read-only API queries (ScoutSuite, Azure inventory, Nmap) are overnight-safe. Active network poisoning (Responder) is **not** overnight-safe and will auto-stop via `atd` scheduling.
+> **Network vs offline jobs:** Hashcat, nmap, and ScoutSuite are all terminal-safe — they survive terminal close via `nohup`/`disown`. Responder is an active network poisoner and **must stop at `TESTING_WINDOW_END`** regardless of terminal state. It is auto-stopped via `atd` scheduling when started.
 
 ---
 
@@ -416,8 +421,8 @@ python3 orchestrator.py --phase 1 --only bloodhound,roadrecon
 
 | Phase | Key | Description |
 |-------|-----|-------------|
-| 1 | `host_sweep` | Nmap host sweep across all subnets |
-| 1 | `nmap_fullscan` | Nmap full port scan -p- (background, overnight) |
+| 1 | `host_sweep` | TCP SYN host sweep across all subnets (no ICMP/ARP — avoids infrastructure false positives) |
+| 1 | `nmap_fullscan` | Full port scan -p- split across vCPU parallel jobs; merge watcher auto-consolidates results |
 | 1 | `smb_sweep` | CrackMapExec SMB sweep + signing check |
 | 1 | `ldap_banner` | LDAP rootDSE banner grab from DC |
 | 1 | `ldap_users` | LDAP domain user enumeration |
@@ -447,60 +452,58 @@ python3 orchestrator.py --phase 1 --only bloodhound,roadrecon
 
 `--skip` / `--only` and file-based idempotency (`skip_if_exists`) are independent and layer on top of each other:
 
-- `--skip nmap_fullscan` → skips the step regardless of whether `fullscan.xml` exists
-- No flag, `fullscan.xml` exists → `skip_if_exists` skips it automatically
-- No flag, `fullscan.xml` missing → step runs normally
+- `--skip nmap_fullscan` → skips the step regardless of whether `fullscan.gnmap` exists
+- No flag, `fullscan.gnmap` exists → `skip_if_exists` skips it automatically
+- No flag, `fullscan.gnmap` missing → step runs normally
 
-To force a step to re-run even if its output file already exists, delete the output file:
+To force a full-port scan to re-run even if its output already exists, delete the merged output and the chunk directory:
 ```bash
-rm ~/vapt/phase1/network/fullscan.xml
+rm -rf ~/vapt/phase1/network/fullscan.gnmap ~/vapt/phase1/network/scan_chunks/
 python3 orchestrator.py --phase 1 --only nmap_fullscan
 ```
 
 ---
 
-## 9a. Overnight Workflow — Keeping Jobs Running After Terminal Close
+## 9a. Session Management — Terminal Safety and Job Continuity
 
 ### Why jobs survive terminal close
 
-All background jobs are launched with `nohup` + `disown` (in `bg_run()` in `lib/common.sh`). This means:
+All background jobs are launched with `nohup` + `disown` via `bg_run()` in `lib/common.sh`:
 
-- **`nohup`** — the process ignores SIGHUP. When the terminal closes, the kernel sends SIGHUP to all attached processes. `nohup` blocks this signal, so the job keeps running.
-- **`disown`** — removes the job from bash's job table. Bash would otherwise send SIGHUP to all its job-table entries when it exits.
+- **`nohup`** — blocks SIGHUP so the job continues when the terminal closes
+- **`disown`** — removes the job from bash's job table
+- **`.bg_jobs`** — every PID is written to `${OUTPUT_BASE_DIR}/.bg_jobs` so `--status` can track completion across sessions
 
-The PID of every background job is also written to `${OUTPUT_BASE_DIR}/.bg_jobs` so the next session can check which jobs finished overnight.
+Background jobs run as fast as the system allows — they are not designed to be "set and wait". Check `--status` regularly and proceed to the next phase as soon as current-phase jobs complete.
 
-### Standard end-of-day procedure (tmux recommended)
-
-tmux is the recommended way to manage the attack session. It provides a persistent terminal session that jobs can be checked on from any SSH client. If the machine is local (no SSH), the `nohup`/`disown` approach alone is sufficient.
+### tmux (recommended for SSH sessions)
 
 ```bash
-# ── Start of day: start a named tmux session
+# Start a named session
 tmux new-session -d -s vapt
 tmux attach -t vapt
 
-# ── Run phases inside tmux
+# Run phases inside tmux
 python3 orchestrator.py --phase 1
 
-# ── End of day: detach cleanly (Ctrl+B, then D)
-# The session keeps running. All bg jobs continue via nohup.
-# The terminal can be closed or the SSH session can drop — jobs survive.
+# Detach without stopping anything (Ctrl+B then D)
 
-# ── Next morning: reattach to check live status
+# Re-attach from any SSH client
 tmux attach -t vapt
-# or, if you just want the morning briefing without re-attaching:
+
+# Check status without re-attaching
 python3 orchestrator.py --status
 ```
 
-### Morning briefing command
+If the machine is local (no SSH), `nohup`/`disown` alone is sufficient — tmux is optional.
+
+### Job status check
 
 ```bash
-# See which overnight jobs completed and which are still running:
 python3 orchestrator.py --status
 ```
 
-The `--status` output shows:
-
+Output example:
 ```
 ════════════════════════════════════════════════════════════════
   Phase Completion Summary
@@ -510,66 +513,53 @@ The `--status` output shows:
   Phase 2  ✘  Not Started  Vulnerability Assessment
 ...
 ════════════════════════════════════════════════════════════════
-  Overnight Background Job Status
+  Background Job Status
 ════════════════════════════════════════════════════════════════
 
-  ✔  COMPLETE   nmap_fullscan (PID: 12345)
-     Started: 2026-04-08 09:05:12
-     Nmap done: 4 IP address (4 hosts up) scanned
-
-  ⏳ RUNNING    scoutsuite_abc123def456 (PID: 13201)
-     Started: 2026-04-08 09:07:44
-     Log:     /home/.../phase2/cloud/scoutsuite_abc123def456.log
+  ✔  COMPLETE   nmap_fullscan_chunk_aa (PID: 12345)
+  ✔  COMPLETE   nmap_fullscan_chunk_ab (PID: 12346)
+  ⏳ RUNNING    nmap_fullscan_merge (PID: 12400)
+     Log:     .../phase1/network/nmap_merge.log
 ...
-  Completed overnight: 3   Still running: 1
+  Completed: 5   Still running: 1
 ════════════════════════════════════════════════════════════════
-  Resume any unfinished phase: python3 orchestrator.py --phase N
 ```
 
 ### Resuming interrupted phases
 
-The framework is idempotent. Every step uses `skip_if_exists()` to check whether its output file already exists before running. Re-running a phase picks up from where it left off — completed steps are skipped automatically.
+The framework is fully idempotent. Re-running any phase picks up from where it stopped — `skip_if_exists()` skips steps whose output file already exists.
 
 ```bash
-# Phase 1 ran overnight. Nmap finished. BloodHound was interrupted.
-# Re-running phase 1 skips nmap (fullscan.xml exists) and resumes BloodHound.
+# Nmap finished, BloodHound was interrupted — re-run phase 1
+# nmap steps are skipped (fullscan.gnmap exists), BloodHound resumes
 python3 orchestrator.py --phase 1
 ```
 
-### Responder auto-stop
+### Responder auto-stop (RoE requirement)
 
-Responder is the exception: it is an active network poisoner and **must stop at 17:00** per the RoE testing window. The framework schedules an automatic kill via `atd` when Responder starts:
+Responder is an active network poisoner and **must stop at `TESTING_WINDOW_END`** (default 17:00) per the RoE. The framework schedules an automatic kill via `atd`:
 
 ```bash
-# Scheduled automatically — no manual step required:
-echo "sudo pkill -f 'responder.*-I.*eth0'" | at 17:00
-
-# Verify the job is queued:
+# Verify the kill job is queued after starting Responder:
 atq
 
-# If atd is not available on your Kali install:
+# If atd is not available:
 sudo systemctl enable atd --now
 ```
 
-If `atd` is unavailable, Phase 3 logs a warning with the manual kill command. Check the log:
-
+If `atd` is unavailable, Phase 3 prints the manual kill command and logs a warning. Verify:
 ```bash
 grep 'auto-stop\|REMINDER\|Responder' "${OUTPUT_BASE_DIR}/engagement_log.md"
 ```
 
-### Re-running a passive job outside business hours
+### Re-running a job outside business hours
 
-If you need to restart an overnight-safe job (e.g. Nmap was interrupted) after 17:00:
+To restart a non-network job (Hashcat, merge watcher) outside the testing window:
 
 ```bash
-# Option 1: disable the window check temporarily
-# Edit config.env: set ENFORCE_TESTING_WINDOW=false
-# Then re-run the phase — the passive job restarts, skip_if_exists handles the rest
-python3 orchestrator.py --phase 1
-
-# Option 2: run the phase script directly (bypasses orchestrator window gate)
-export $(cat config.env | grep -v '^#' | xargs)
-bash phases/phase1_discovery.sh
+# Temporarily disable the window gate (edit config.env)
+# ENFORCE_TESTING_WINDOW=false
+python3 orchestrator.py --phase 3 --only hashcat
 ```
 
 ---
@@ -578,17 +568,14 @@ bash phases/phase1_discovery.sh
 
 | Time | Action |
 |------|--------|
-| 08:50 | `python3 orchestrator.py --status` — morning briefing, see overnight results |
-| 08:55 | Start BloodHound CE if not running: `docker compose -f tools/bloodhound-ce/docker-compose.yml up -d` |
-| 09:00 | Resume or continue: `python3 orchestrator.py --phase <today>` |
-| 09:05 | Background jobs start / resume (Nmap, ScoutSuite, Responder, Hashcat, ZAP) |
-| 09:10–12:00 | Active work: BloodHound analysis, Burp testing, manual AD checks |
-| 12:00 | Check background job status; review any cracked hashes |
-| 13:00–16:30 | Active exploitation / lateral movement (with operator gates) |
-| 16:30 | Confirm overnight-safe jobs are running (Nmap, Hashcat, ScoutSuite) |
-| 16:55 | Verify Responder `atq` shows stop job queued; log work in `engagement_log.md` |
-| 17:00 | Detach tmux (`Ctrl+B, D`) or close terminal — overnight jobs continue via nohup |
-| 08:50 +1 | `python3 orchestrator.py --status` — check what completed |
+| Start of day | `python3 orchestrator.py --status` — check what completed |
+| +5 min | Start BloodHound CE if not running: `docker compose -f tools/bloodhound-ce/docker-compose.yml up -d` |
+| `TESTING_WINDOW_START` | `python3 orchestrator.py --phase <today>` |
+| +5 min | Background jobs start / resume (Nmap chunks, ScoutSuite, Hashcat, ZAP) |
+| Active hours | BloodHound analysis, Burp testing, manual AD checks, review cracked hashes as they appear |
+| Active hours | Exploitation / lateral movement (phases 3–4, operator-gated) |
+| 30 min before `TESTING_WINDOW_END` | Verify Responder `atq` shows stop job queued; update `engagement_log.md` |
+| `TESTING_WINDOW_END` | Active attacks stop. Non-network jobs (Hashcat) continue. Detach tmux or close terminal. |
 
 ---
 

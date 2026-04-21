@@ -121,7 +121,9 @@ Every phase script calls `checkpoint()` before sensitive actions. This function:
 3. Writes the decision to `engagement_log.md` with a timestamp
 4. Returns 0 (proceed) or 1 (skip) — `q` calls `exit 1`
 
-Checkpoints cannot be bypassed via command-line flags. The `--auto-proceed` flag on the Bash `checkpoint()` function exists only for non-destructive informational steps.
+**Non-interactive bypass:** passing `--auto-approve` to the orchestrator sets `AUTO_APPROVE=true` in the environment. The `checkpoint()` function in `lib/common.sh` checks this variable and auto-proceeds, logging `Checkpoint auto-proceeded`. This is intended for demo runs, dry-runs, and CI/CD pipelines — it should never be used during live exploitation phases (3, 4). The Python `check_testing_window()` function also respects `--auto-approve` and `--dry-run`, bypassing the business hours prompt automatically in those modes.
+
+All `input()` calls in the orchestrator have `EOFError` guards so that piping stdin (e.g. `echo y | python3 orchestrator.py`) does not cause a crash.
 
 ### `set -euo pipefail`
 
@@ -179,16 +181,35 @@ bg_run "job_name" "log_file_path" command [args...]
 - `status_bg_jobs()` — prints live/done status for each job
 - `cleanup_on_exit()` — kills every tracked process group on Ctrl+C
 
-**Limitation:** `BG_JOB_PIDS` is a shell array local to the running phase script. It does not persist across phase boundaries. If Phase 1 starts a background job and Phase 2 begins in a new shell invocation, Phase 2 has no knowledge of Phase 1's PIDs. The `orchestrator.py --status` command addresses this by reading log text markers (phase START/END markers), not actual process state.
+Every background job PID is also written to `${OUTPUT_BASE_DIR}/.bg_jobs` (format: `PID|name|logfile|started_at`). This file survives terminal close and is read by `orchestrator.py --status` to report job completion across sessions.
 
-**Sudo-wrapped processes (Responder):** Responder runs under `sudo timeout`, which creates a process tree: shell → sudo → timeout → responder. `cleanup_on_exit()` addresses this by killing the entire process group (`kill -- -<pgid>`) rather than just the top-level PID.
+**System-adaptive parallelism:** `detect_system_resources()` (called at phase startup) detects vCPU count and RAM at runtime and exports tuning constants:
+
+| Export | Formula (4-vCPU example) | Used by |
+|--------|--------------------------|---------|
+| `NMAP_MIN_PARALLEL` | `vCPUs × 10` = 40 | nmap `--min-parallelism` |
+| `NMAP_MAX_PARALLEL` | `vCPUs × 50`, cap 500 = 200 | nmap `--max-parallelism` |
+| `HC_WORKLOAD` | `3` (high) if ≥4 vCPUs, else `2` | hashcat `-w` |
+| `BH_WORKERS` | `vCPUs × 5`, cap 40 = 20 | bloodhound-python `-w` |
+
+**Parallel Nmap full-port scan:** For host lists >50 entries, Phase 1 splits the host list into `SYS_VCPUS` chunks using `split -l` and launches one `nmap -p-` process per chunk as a background job. A separate merge-watcher background job polls every 30 seconds until all chunk `.xml` files appear (nmap writes `.xml` atomically at completion), then concatenates the `.gnmap` and `.nmap` files into `fullscan.gnmap` / `fullscan.nmap`. On a 4-vCPU system this yields approximately 4× wall-clock speedup over a single sequential scan.
+
+**Hashcat concurrent output files:** The three NTLMv2 cracking jobs (rockyou, rules, corporate) each write to a separate output file (`cracked_ntlm_rockyou.txt`, etc.) to prevent concurrent-write corruption. A merge step combines them into `cracked_ntlm.txt` which downstream phases and Phase 5 reference.
+
+**Limitation:** `BG_JOB_PIDS` is a shell array local to the running phase script. It does not persist across phase invocations. `orchestrator.py --status` addresses this by reading `.bg_jobs` on disk (process state) and `engagement_log.md` (phase start/end markers) rather than relying on in-memory arrays.
+
+**Sudo-wrapped processes (Responder):** Responder runs under `sudo timeout`, which creates a process tree: shell → sudo → timeout → responder. `cleanup_on_exit()` kills the entire process group (`kill -- -<pgid>`) rather than just the top-level PID to ensure the responder process itself is killed.
 
 ---
 
 ## 6. Tool Selection Rationale
 
 ### Network discovery — Nmap
-Nmap is the industry standard. SYN scan (`-sS`) with service detection (`-sV`) and default scripts (`-sC`) provides the best balance of coverage and reliability. Alternatives considered: masscan (faster but less reliable service detection), naabu (Go-based, good for large scopes but requires Go runtime). Nmap is available in Kali repositories without any configuration.
+Nmap is the industry standard. SYN scan (`-sS`) with service detection (`-sV`) and default scripts (`-sC`) provides the best balance of coverage and reliability. Alternatives considered: masscan (faster but less reliable service detection), naabu (Go-based, good for large scopes but requires Go runtime).
+
+**Host discovery — TCP SYN only, no ICMP/ARP:** The host sweep uses `nmap -sS --open -p <NMAP_DISCOVERY_PORTS>` rather than the `-sn` ping sweep. The `-sn` default sends ICMP echo + ICMP timestamp + TCP SYN/ACK to ports 80/443 — every router, switch, printer, UPS, and IPMI card on an enterprise network responds to ICMP, generating hundreds of false positives. TCP SYN probes to SMB (445), RDP (3389), and WinRM (5985) only produce responses from real Windows workstations and servers. `--max-retries 1` (vs. nmap's default 6) further reduces false positives from filtered ports being re-probed. `SCAN_EXCLUDE_RANGES` allows explicitly excluding known infrastructure.
+
+**Full-port scan parallelism:** The full-port scan (`-p-`) is split across `SYS_VCPUS` parallel nmap processes to maximise CPU utilisation. A merge-watcher job auto-consolidates results when all chunks complete. Timing uses `T3` (normal) rather than `T4` (aggressive) for better accuracy on congested internal networks.
 
 ### SMB enumeration — NetExec (nxc) / CrackMapExec
 CrackMapExec was the standard for Windows/SMB enumeration. It was renamed and re-maintained as NetExec (`nxc`) from 2023. The framework auto-detects whichever is installed via `detect_cme()`. The command interface is identical between the two.
@@ -209,7 +230,7 @@ ScoutSuite provides automated multi-service cloud security auditing against a de
 Certipy automates the discovery and exploitation of Active Directory Certificate Services misconfigurations (ESC1–ESC8). It is the only tool that comprehensively covers the AD CS attack surface from Linux without requiring domain membership.
 
 ### Password cracking — Hashcat
-Hashcat is the fastest CPU/GPU password cracker available. The framework runs three cracking jobs in parallel: rockyou (coverage), rockyou + best64 rules (rule-based mutations), and corporate patterns (organisation-specific wordlist). Alternative: John the Ripper is slower and less GPU-optimised.
+Hashcat is the fastest CPU/GPU password cracker available. The framework runs three NTLMv2 cracking jobs in parallel: rockyou (coverage), rockyou + best64 rules (rule-based mutations), and corporate patterns (organisation-specific wordlist generated in Phase 0). Each job writes to its own output file to prevent concurrent-write corruption; results are merged into `cracked_ntlm.txt`. Workload profile (`-w`) and kernel selection (`--optimized-kernel-enable`) are tuned to the detected vCPU count via `detect_system_resources()`. Alternative: John the Ripper is slower and less GPU-optimised.
 
 ### LLMNR/NBT-NS poisoning — Responder
 Responder is the standard tool for capturing NTLMv2 challenge-response hashes via LLMNR, NBT-NS, and MDNS poisoning. The `-rdwF` flags enable Responder, WPAD rogue proxy, and forced authentication. In relay mode (SMB/HTTP disabled), it works with `impacket-ntlmrelayx`.
@@ -273,7 +294,8 @@ The `skip_if_exists()` function checks for Tier 1 outputs before re-running any 
    - `set -euo pipefail`
    - `source "${SCRIPT_DIR}/../lib/common.sh"`
    - `log PHASE "..."` and `check_testing_window`
+   - `detect_system_resources` if the phase launches parallel or background work
    - `require_var` calls for all needed variables
-   - `detect_cme` if the phase uses network tools
+   - `detect_cme` if the phase uses CME/nxc for network operations
 2. Register the phase in `PHASES` dict in `orchestrator.py` with name, script path, days, automatable flag, secrets_needed, and background_jobs.
 3. Update the README phase table.

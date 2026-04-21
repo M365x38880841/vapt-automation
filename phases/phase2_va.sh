@@ -333,19 +333,44 @@ elif [[ -n "${NESSUS_URL:-}" && -n "${NESSUS_USER:-}" && -n "${NESSUS_PASS:-}" ]
     log INFO "Triggering Nessus scan via API..."
     NESSUS_SCAN_OUT="${OUT_NET}/nessus_scan.json"
 
-    # Get API token
+    # Authenticate and get session token
     TOKEN=$(curl -sk -X POST "${NESSUS_URL}/session" \
         -H 'Content-Type: application/json' \
         -d "{\"username\":\"${NESSUS_USER}\",\"password\":\"${NESSUS_PASS}\"}" \
         | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])" 2>/dev/null || echo "")
 
     if [[ -n "${TOKEN}" ]]; then
-        # List existing scans to find or create
+        # Save scan list for reference
         curl -sk -X GET "${NESSUS_URL}/scans" \
             -H "X-Cookie: token=${TOKEN}" \
             -o "${NESSUS_SCAN_OUT}" 2>/dev/null
         log OK "Nessus API reachable. Scan list saved → ${NESSUS_SCAN_OUT}"
-        log MANUAL "Launch the Nessus credentialed scan from the UI or configure scan ID in config.env as NESSUS_SCAN_ID and re-run."
+
+        if [[ -n "${NESSUS_SCAN_ID:-}" ]]; then
+            # Launch the pre-configured credentialed scan by ID
+            if checkpoint "Launch Nessus credentialed scan ID=${NESSUS_SCAN_ID} via API?"; then
+                LAUNCH_RESP=$(curl -sk -X POST "${NESSUS_URL}/scans/${NESSUS_SCAN_ID}/launch" \
+                    -H "X-Cookie: token=${TOKEN}" \
+                    -H 'Content-Type: application/json' 2>/dev/null || echo "")
+                SCAN_UUID=$(echo "${LAUNCH_RESP}" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('scan_uuid',''))" 2>/dev/null || echo "")
+                if [[ -n "${SCAN_UUID}" ]]; then
+                    log OK "Nessus scan launched. UUID: ${SCAN_UUID}"
+                    echo "${SCAN_UUID}" > "${OUT_NET}/nessus_scan_uuid.txt"
+                    log INFO "Monitor progress: ${NESSUS_URL}/#/scans/${NESSUS_SCAN_ID}"
+                else
+                    log WARN "Nessus launch returned unexpected response: ${LAUNCH_RESP}"
+                    log WARN "Check scan ID ${NESSUS_SCAN_ID} is valid and the policy allows API launch."
+                fi
+            else
+                log WARN "Nessus scan launch skipped by operator — launch manually at ${NESSUS_URL}"
+            fi
+        else
+            log WARN "NESSUS_SCAN_ID not set — cannot auto-launch. Set it in config.env."
+            log MANUAL "Launch the Nessus credentialed scan from the UI, then set NESSUS_SCAN_ID to the scan ID for future runs."
+        fi
+
+        # Clean up session token
+        curl -sk -X DELETE "${NESSUS_URL}/session" -H "X-Cookie: token=${TOKEN}" &>/dev/null || true
     else
         log WARN "Nessus API auth failed. Launch scan manually via UI at ${NESSUS_URL}"
     fi

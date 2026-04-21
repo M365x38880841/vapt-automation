@@ -20,7 +20,7 @@ The framework covers six phases:
 | 2 | Vulnerability Assessment | Full (bg jobs) | Days 5–7 |
 | 3 | Exploitation | Partial | Days 8–11 |
 | 4 | Post-Exploitation | Partial | Days 9–11 |
-| 5 | Reporting & Debrief | Scaffold only | Days 12–14 |
+| 5 | Reporting & Debrief | Full (scaffold + evidence) | Days 12–14 |
 
 **What is automated:** host sweeps, full port scans, SMB enumeration, LDAP enumeration, BloodHound collection, ROADrecon Entra ID gather, Azure resource inventory, ScoutSuite cloud audit, AD CS vulnerability checks (certipy), SMB vulnerability modules, Kerberoasting, AS-REP roasting, Responder poisoning, Hashcat cracking, Pass-the-Hash sweeps, Azure public storage proofs-of-concept, OWASP ZAP web scanning, SAM dump sweeps, blast radius documentation, evidence consolidation, report scaffolding.
 
@@ -83,7 +83,7 @@ nano config.env          # fill in all non-sensitive values (see Configuration s
 # 3. Make scripts executable
 chmod +x orchestrator.py phases/*.sh lib/common.sh
 
-# 4. Verify what will run (dry-run — no commands executed)
+# 4. Verify what will run (dry-run — no commands executed, all gates auto-approved)
 python3 orchestrator.py --phase 0,1,2,3,4,5 --dry-run
 
 # 5. Run Phase 0 (installs tools, starts BloodHound CE, validates config)
@@ -92,11 +92,14 @@ python3 orchestrator.py --phase 0
 # 6. Run a single phase interactively
 python3 orchestrator.py --phase 1
 
-# 7. Check phase and overnight background job status
+# 7. Check background job and phase completion status
 python3 orchestrator.py --status
 
 # 8. Run all remaining phases in sequence
 python3 orchestrator.py --phase 1,2,3,4,5
+
+# 9. Non-interactive / pipeline run (auto-approves all checkpoints)
+python3 orchestrator.py --phase 0,1,2 --auto-approve
 
 # 9. List all phases and their automation level
 python3 orchestrator.py --list
@@ -198,10 +201,12 @@ Copy `config.env.example` to `config.env` and set every value before running Pha
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NMAP_TIMING` | `4` | Nmap timing template (1=stealth, 5=fastest). 4 is recommended. |
-| `NMAP_MIN_HOSTGROUP` | `32` | Parallel host groups for Nmap |
-| `HASHCAT_DEVICE` | `1` | `1`=CPU, `2`=GPU. GPU is dramatically faster. |
-| `RESPONDER_DURATION` | `7200` | Responder run time in seconds (default 2 hours) |
+| `NMAP_TIMING` | `3` | Nmap timing template (1=stealth, 5=fastest). `3` is the recommended default — balanced stealth and speed. Avoid `4`/`5` for discovery sweeps: they increase false positives. |
+| `NMAP_MAX_RATE` | `500` | Maximum packet rate (packets/sec) for host sweep. `300–500` = stealth-first. `750–1500` = faster on a quiet internal LAN. Full-port scan uses `2×` this value. |
+| `NMAP_DISCOVERY_PORTS` | `22,80,135,139,443,445,3389,5985,8080,8443` | TCP ports probed during host discovery sweep. **TCP SYN probes only — no ICMP/ARP.** This eliminates false positives from routers, switches, printers, and IPMI cards that respond to ICMP but do not run SMB/RDP/WinRM. Adjust for your environment. |
+| `SCAN_EXCLUDE_RANGES` | _(empty)_ | Space-separated IPs/CIDRs excluded from all nmap scans (e.g. `10.10.0.1 192.168.1.0/28`). Add default gateways, monitoring probes, and printer subnets to avoid known-false-positive infrastructure. |
+| `HASHCAT_DEVICE` | `1` | `1`=CPU, `2`=GPU. GPU is dramatically faster when available. Parallelism auto-scales to detected vCPU count. |
+| `RESPONDER_DURATION` | `7200` | Responder capture window in seconds (default 2 hours). Responder **must** stop at `TESTING_WINDOW_END` — auto-stop is scheduled via `atd`. |
 
 ### Web application testing (DAST)
 
@@ -232,10 +237,11 @@ Copy `config.env.example` to `config.env` and set every value before running Pha
 | Variable | Description |
 |----------|-------------|
 | `NESSUS_URL` | Nessus API base URL (e.g. `https://localhost:8834`) |
-| `NESSUS_SCAN_ID` | Pre-configured scan policy ID from the Nessus UI |
-| `SLACK_WEBHOOK_URL` | Webhook for background job completion alerts |
-| `SPRAY_ENABLED` | `true` to enable password spray pass in Phase 1 |
-| `SPRAY_MAX_ATTEMPTS` | Max attempts per account before lockout risk |
+| `NESSUS_SCAN_ID` | Pre-configured scan policy ID from the Nessus UI. When set alongside `NESSUS_USER`/`NESSUS_PASS`, Phase 2 automatically launches the scan via `POST /scans/{ID}/launch` and saves the resulting scan UUID. |
+| `SLACK_WEBHOOK_URL` | Webhook URL for background job completion notifications |
+| `SPRAY_ENABLED` | `true` to enable a controlled password spray in Phase 1. Reads `SPRAY_MAX_ATTEMPTS` and `SPRAY_DELAY_SECONDS`. Will refuse to spray if the lockout threshold from Phase 2 password policy is not safely above `SPRAY_MAX_ATTEMPTS`. |
+| `SPRAY_MAX_ATTEMPTS` | Max spray attempts per user per run (default `2` — stay well below domain lockout threshold) |
+| `SPRAY_DELAY_SECONDS` | Delay between spray rounds in seconds (default `1800` = 30 min) |
 
 ---
 
@@ -247,13 +253,15 @@ Credentials prompted per phase:
 
 | Secret | Phases | Notes |
 |--------|--------|-------|
-| `DOMAIN_USER` | 1, 2, 3, 4 | Domain username only — not an email |
-| `DOMAIN_PASS` | 1, 2, 3, 4 | Hidden input |
+| `DOMAIN_USER` | 1, 2, 3, 4 | Domain username only — not an email address |
+| `DOMAIN_PASS` | 1, 2, 3, 4 | Hidden input via `getpass` |
 | `AZURE_USER` | 1 (optional) | Leave blank to use device code flow |
 | `AZURE_PASS` | 1 (optional) | Leave blank to use device code flow |
-| `OBTAINED_HASH` | 3, 4 | NTLM hash from cracking/capture for PtH |
-| `NESSUS_USER` | 2 (optional) | Only if Nessus API is configured |
-| `NESSUS_PASS` | 2 (optional) | Only if Nessus API is configured |
+| `OBTAINED_HASH` | 3, 4 | NTLM hash for PtH sweep / lateral move. Phase 4 sam_sweep will abort if this is not set. |
+| `NESSUS_USER` | 2 | Required for Nessus API trigger (scan launch + session cleanup) |
+| `NESSUS_PASS` | 2 | Required for Nessus API trigger |
+
+All secrets are collected sorted alphabetically at orchestrator startup (once per run, not once per phase). Prompts are hidden using Python's `getpass`.
 
 ---
 
@@ -269,13 +277,18 @@ All output is written under `OUTPUT_BASE_DIR` (default: `~/vapt/`). Phase 0 crea
 │   └── {network,ad,web,cloud,misc}/
 ├── phase1/
 │   ├── network/
-│   │   ├── live_hosts_all.txt     # Merged live host list from all subnets
-│   │   ├── fullscan.{xml,gnmap,nmap}  # Full port scan results
-│   │   └── hostsweep_<subnet>.*
+│   │   ├── live_hosts_all.txt         # Merged validated live hosts (TCP SYN confirmed)
+│   │   ├── hostsweep_<subnet>.*       # Per-subnet TCP discovery scan output
+│   │   ├── fullscan.{gnmap,nmap}      # Merged full port scan (auto-assembled by merge watcher)
+│   │   └── scan_chunks/               # Parallel scan chunks (one per vCPU) + merge watcher log
+│   │       ├── chunk_aa, chunk_ab, …  # Host list splits for parallel nmap jobs
+│   │       ├── fullscan_chunk_aa.*    # Per-chunk nmap output
+│   │       └── nmap_merge.log         # Merge watcher job log
 │   ├── ad/
-│   │   ├── userlist.txt           # Clean username list for AS-REP / spray
-│   │   ├── bloodhound/            # BloodHound collection ZIPs
-│   │   ├── relay_target_ips.txt   # Hosts with SMB signing disabled
+│   │   ├── userlist.txt               # Clean username list for AS-REP / spray
+│   │   ├── bloodhound/                # BloodHound collection ZIPs
+│   │   ├── relay_target_ips.txt       # Hosts with SMB signing disabled
+│   │   ├── spray_results.txt          # Password spray results (if SPRAY_ENABLED=true)
 │   │   └── ldap_users.txt
 │   └── cloud/
 │       ├── roadrecon.db           # ROADrecon Entra ID database
@@ -303,8 +316,13 @@ All output is written under `OUTPUT_BASE_DIR` (default: `~/vapt/`). Phase 0 crea
 │   └── ad/
 │       ├── kerberoast_tickets.txt
 │       ├── asrep_hashes.txt
-│       ├── ntlmv2_all.txt         # Merged Responder captures (all users)
-│       ├── cracked_{ntlm,tgs,asrep}.txt
+│       ├── ntlmv2_all.txt                 # Merged Responder captures (all users, deduped)
+│       ├── cracked_ntlm.txt               # Merged NTLMv2 cracks (from all 3 wordlist jobs)
+│       ├── cracked_ntlm_rockyou.txt       # rockyou.txt job output
+│       ├── cracked_ntlm_rules.txt         # rockyou + best64 rules job output
+│       ├── cracked_ntlm_corp.txt          # Corporate patterns job output
+│       ├── cracked_tgs.txt                # Kerberoast cracks
+│       ├── cracked_asrep.txt              # AS-REP cracks
 │       └── pth_accessible_hosts.txt
 ├── phase4/
 │   ├── ad/
@@ -313,8 +331,11 @@ All output is written under `OUTPUT_BASE_DIR` (default: `~/vapt/`). Phase 0 crea
 │       ├── blast_radius.md        # Attack hop log
 │       └── summary.md             # Full post-exploitation summary
 ├── report/
-│   ├── evidence/                  # Consolidated evidence copies
-│   └── TECHNICAL_REPORT_SCAFFOLD.md
+│   ├── evidence/                      # Consolidated evidence copies
+│   │   ├── {network,ad,cloud,web,cracked}/
+│   │   └── summary.md
+│   ├── TECHNICAL_REPORT_SCAFFOLD.md   # Pre-populated finding scaffold
+│   └── evidence_manifest.sha256       # SHA-256 checksums of all evidence files
 └── tools/
     └── corporate_patterns.txt     # Auto-generated password pattern list
 ```
@@ -333,10 +354,10 @@ docker compose -f tools/bloodhound-ce/docker-compose.yml ps
 docker compose -f tools/bloodhound-ce/docker-compose.yml logs bloodhound \
     2>&1 | grep -i 'initial password\|password'
 
-# Stop the stack (e.g. overnight)
+# Stop the stack when not in use
 docker compose -f tools/bloodhound-ce/docker-compose.yml down
 
-# Start again next morning
+# Restart the stack
 docker compose -f tools/bloodhound-ce/docker-compose.yml up -d
 ```
 
@@ -346,26 +367,31 @@ Access the UI at **http://localhost:8080**. Import the BloodHound ZIP from `~/va
 
 ## Monitoring Background Jobs
 
-Long-running jobs (Nmap, Hashcat, Responder, ScoutSuite, ZAP) run in the background via `nohup` + `disown` and survive terminal close. Monitor them:
+Long-running jobs (Nmap, Hashcat, Responder, BloodHound, ROADrecon, ScoutSuite, ZAP) run via `nohup` + `disown` and survive terminal close. All PIDs are persisted to `.bg_jobs` so `--status` can track them across sessions.
 
 ```bash
-# Morning briefing — phase status + overnight job results
+# Phase completion + background job status
 python3 orchestrator.py --status
 
-# Nmap full scan progress
-tail -f ~/vapt/phase1/network/fullscan.log
+# Nmap: parallel chunk progress (one log per vCPU chunk)
+tail -f ~/vapt/phase1/network/scan_chunks/fullscan_chunk_aa.log
+# Merge watcher (fires when all chunks complete)
+tail -f ~/vapt/phase1/network/nmap_merge.log
 
-# Responder captures (count by user)
+# Responder: hash capture count
 ls /usr/share/responder/logs/SMB-NTLMv2-*.txt 2>/dev/null | wc -l
 
-# Hashcat cracking progress (live)
-tail -f ~/vapt/phase3/ad/hashcat_ntlm.log
+# Hashcat: live progress (separate log per wordlist job)
+tail -f ~/vapt/phase3/ad/hashcat_ntlm.log        # rockyou job
+tail -f ~/vapt/phase3/ad/hashcat_ntlm_rules.log  # rules job
+cat  ~/vapt/phase3/ad/cracked_ntlm.txt           # merged results so far
 
 # ZAP scan progress per target
 tail -f ~/vapt/phase2/web/zap/<target>/zap.log
 
 # Kill all background jobs (emergency)
-pkill -f "responder|hashcat|nmap|bloodhound-python|roadrecon|scout|zaproxy"
+sudo pkill -f "responder" 2>/dev/null
+pkill -f "hashcat|nmap|bloodhound-python|roadrecon|scout|zaproxy" 2>/dev/null
 ```
 
 ---

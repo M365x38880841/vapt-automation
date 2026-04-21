@@ -30,12 +30,14 @@ Perform these tasks before each engagement and at minimum once per quarter:
 | Run pre-engagement verification checklist | ✓ | ✓ |
 | Check for pipx tool updates | ✓ | ✓ |
 | Check for `nxc` / `crackmapexec` updates | ✓ | ✓ |
+| Verify `config.env` has no placeholder values; `SCAN_EXCLUDE_RANGES` reflects current infra | ✓ | |
+| Validate `NMAP_DISCOVERY_PORTS` is still appropriate for the target environment | ✓ | |
 | Review new BloodHound CE release notes | | ✓ |
 | Review new OWASP ZAP release notes | | ✓ |
 | Check `requirements.txt` version pins still valid | | ✓ |
 | Review new Kali release notes for breaking changes | | ✓ |
 | Test on a lab environment | | ✓ |
-| Update corporate patterns wordlist with new year | Annually | |
+| Update corporate patterns wordlist with new year (ORG_WORDS / YEARS in phase0_setup.sh) | Annually | |
 
 ---
 
@@ -265,6 +267,7 @@ cp -u "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/constrained_delegation.txt" "${EVI
 
 - Add the step key to the step table in `docs/RUNBOOK.md §9b`
 - Add the check to the "What is automated" list in `README.md`
+- If the new check produces a background job, add it to `docs/RUNBOOK.md §9` monitoring reference table
 
 ---
 

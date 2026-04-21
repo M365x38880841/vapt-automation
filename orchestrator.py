@@ -60,9 +60,9 @@ PHASES = {
         "days": "Days 3–4",
         "automatable": True,
         "requires_creds": True,
-        "description": "Nmap, CrackMapExec, BloodHound, ROADrecon, Azure CLI enumeration",
+        "description": "TCP host sweep (no ICMP), parallel full port scan, CME, BloodHound, ROADrecon, Azure CLI",
         "secrets_needed": ["DOMAIN_USER", "DOMAIN_PASS"],
-        "background_jobs": ["nmap_fullscan", "bloodhound_collect", "roadrecon_gather", "azure_inventory"],
+        "background_jobs": ["nmap_fullscan", "nmap_fullscan_merge", "bloodhound_collect", "roadrecon_gather", "azure_inventory"],
     },
     2: {
         "name": "Vulnerability Assessment",
@@ -71,7 +71,7 @@ PHASES = {
         "automatable": True,
         "requires_creds": True,
         "description": "ScoutSuite, Azure CLI security checks, PingCastle (remote), Nessus API trigger",
-        "secrets_needed": ["DOMAIN_USER", "DOMAIN_PASS"],
+        "secrets_needed": ["DOMAIN_USER", "DOMAIN_PASS", "NESSUS_USER", "NESSUS_PASS"],
         "background_jobs": ["scoutsuite_scan", "azure_security_checks"],
         "manual_steps": [
             "Nessus/OpenVAS credentialed scan — must be configured and launched via UI",
@@ -111,16 +111,17 @@ PHASES = {
     },
     5: {
         "name": "Reporting & Debrief",
-        "script": None,  # No automation — fully manual
+        "script": "phases/phase5_consolidate.sh",
         "days": "Days 12–14",
-        "automatable": False,
+        "automatable": True,
         "requires_creds": False,
-        "description": "Evidence consolidation scaffold only — writing is manual",
+        "description": "Evidence consolidation, report scaffold generation — writing is manual",
         "manual_steps": [
-            "Executive summary report writing",
-            "Per-finding technical write-ups",
-            "MITRE ATT&CK coverage table",
-            "Debrief slide preparation",
+            "Complete each Finding 00X section in the generated scaffold",
+            "Write the Executive Summary in plain business language",
+            "Attach screenshot evidence for every finding",
+            "Have a colleague review before delivery",
+            "Prepare debrief slide deck from top 5 findings",
             "Debrief session with management sponsors",
         ],
     },
@@ -132,7 +133,7 @@ PHASES = {
 STEP_REGISTRY = {
     1: {
         "host_sweep":      "Nmap host sweep across all subnets",
-        "nmap_fullscan":   "Nmap full port scan -p- (background, overnight)",
+        "nmap_fullscan":   "Nmap full port scan -p- (parallel background, auto-merges)",
         "smb_sweep":       "CrackMapExec SMB sweep + signing check",
         "ldap_banner":     "LDAP rootDSE banner grab from DC",
         "ldap_users":      "LDAP domain user enumeration",
@@ -222,7 +223,10 @@ def checkpoint(description: str, dry_run: bool = False) -> bool:
     print(f"{BOLD}{Y}{'━'*64}{RESET}")
     print(f"  [ENTER]=proceed  [s]=skip  [q]=abort: ", end="")
     sys.stdout.flush()
-    choice = input().strip().lower()
+    try:
+        choice = input().strip().lower()
+    except EOFError:
+        choice = ""
     if choice == "q":
         warn(f"Aborted at checkpoint: {description}")
         sys.exit(1)
@@ -231,16 +235,23 @@ def checkpoint(description: str, dry_run: bool = False) -> bool:
         return False
     return True
 
-def check_testing_window(config: dict) -> bool:
+def check_testing_window(config: dict, dry_run: bool = False) -> bool:
     if config.get("ENFORCE_TESTING_WINDOW", "false").lower() != "true":
         return True
     now = datetime.datetime.now().strftime("%H:%M")
     start = config.get("TESTING_WINDOW_START", "09:00")
     end   = config.get("TESTING_WINDOW_END",   "17:00")
     if now < start or now > end:
+        if dry_run or os.environ.get("AUTO_APPROVE", "false").lower() == "true":
+            warn(f"Outside testing window ({now}) — auto-approved (dry-run/AUTO_APPROVE).")
+            return True
         warn(f"Current time {now} is outside testing window ({start}–{end}).")
         print(f"  Override? This may violate the RoE. [y/N]: ", end="")
-        choice = input().strip().lower()
+        sys.stdout.flush()
+        try:
+            choice = input().strip().lower()
+        except EOFError:
+            choice = ""
         if choice != "y":
             return False
         warn(f"Testing window overridden by operator at {now}")
@@ -309,8 +320,8 @@ def run_phase(phase_num: int, config: dict, creds: dict, dry_run: bool, log_file
     phase = PHASES[phase_num]
     phase_banner(phase_num, phase["name"], phase["days"])
 
-    # Business hours gate
-    if not check_testing_window(config):
+    # Business hours gate — bypassed automatically in dry-run and AUTO_APPROVE modes
+    if not check_testing_window(config, dry_run=dry_run):
         error("Testing blocked outside business hours. Exiting.")
         sys.exit(1)
 
@@ -351,6 +362,7 @@ def run_phase(phase_num: int, config: dict, creds: dict, dry_run: bool, log_file
     env["PHASE_NUM"] = str(phase_num)
     env["LOG_FILE"] = str(log_file)
     env["DRY_RUN"] = "false"
+    env["AUTO_APPROVE"] = "true" if dry_run else env.get("AUTO_APPROVE", "false")
     if skip:
         env["SKIP_STEPS"] = skip
         info(f"Steps excluded this run: {skip}")
@@ -396,6 +408,8 @@ def main():
                         help="Comma-separated step keys to skip, e.g. --skip nmap_fullscan,scoutsuite")
     parser.add_argument("--only",       default="",           metavar="STEPS",
                         help="Run only these step keys (skip all others), e.g. --only bloodhound,roadrecon")
+    parser.add_argument("--auto-approve", action="store_true",
+                        help="Auto-approve all checkpoints without prompting (non-interactive/pipeline mode)")
     args = parser.parse_args()
 
     if args.skip and args.only:
@@ -472,7 +486,7 @@ def main():
         # Background job briefing from persistent .bg_jobs file
         bg_jobs_file = output_base / ".bg_jobs"
         print(f"\n{BOLD}{C}{'═'*62}{RESET}")
-        print(f"{BOLD}{C}  Overnight Background Job Status{RESET}")
+        print(f"{BOLD}{C}  Background Job Status{RESET}")
         print(f"{BOLD}{C}{'═'*62}{RESET}")
 
         if not bg_jobs_file.exists():
@@ -529,7 +543,7 @@ def main():
                         for line in tail:
                             print(f"     {line}")
 
-                print(f"\n  {G}Completed overnight: {len(completed)}{RESET}   "
+                print(f"\n  {G}Completed: {len(completed)}{RESET}   "
                       f"{Y}Still running: {len(running)}{RESET}")
 
         print(f"{BOLD}{C}{'═'*62}{RESET}")
@@ -541,7 +555,12 @@ def main():
     print(f"{BOLD}{R}  EMERGENCY STOP: {config.get('EMERGENCY_CONTACT', 'See RoE document')}{RESET}")
     print(f"{Y}  Rules of Engagement must be signed before proceeding.{RESET}")
     print(f"\n  Is the signed RoE document in place? [y/N]: ", end="")
-    if input().strip().lower() != "y":
+    sys.stdout.flush()
+    try:
+        roe_answer = input().strip().lower()
+    except EOFError:
+        roe_answer = ""
+    if roe_answer != "y":
         error("Aborting — RoE not confirmed.")
         sys.exit(1)
 
@@ -557,6 +576,11 @@ def main():
 
     info(f"Phases to run: {phases_to_run}")
 
+    # Propagate auto-approve into child process environment
+    if args.auto_approve:
+        os.environ["AUTO_APPROVE"] = "true"
+        warn("AUTO-APPROVE mode active — all checkpoints will be bypassed.")
+
     # ── Collect all credentials needed upfront
     all_secrets_needed = set()
     for num in phases_to_run:
@@ -566,7 +590,7 @@ def main():
     creds = {}
     if all_secrets_needed and not args.dry_run:
         print(f"\n{BOLD}Collecting credentials for phases {phases_to_run}:{RESET}")
-        creds = collect_credentials(list(all_secrets_needed))
+        creds = collect_credentials(sorted(all_secrets_needed))
 
     # ── Run phases in order
     for phase_num in sorted(phases_to_run):
@@ -576,8 +600,15 @@ def main():
         run_phase(phase_num, config, creds, args.dry_run, log_file,
                   skip=args.skip, only=args.only)
         if phase_num < max(phases_to_run):
+            if args.dry_run or os.environ.get("AUTO_APPROVE", "false").lower() == "true":
+                continue
             print(f"\n{BOLD}  Phase {phase_num} complete. Ready for Phase {phase_num + 1}? [ENTER/q]: {RESET}", end="")
-            if input().strip().lower() == "q":
+            sys.stdout.flush()
+            try:
+                next_choice = input().strip().lower()
+            except EOFError:
+                next_choice = ""
+            if next_choice == "q":
                 warn("Engagement paused by operator.")
                 break
 

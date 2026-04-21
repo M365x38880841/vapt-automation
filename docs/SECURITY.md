@@ -159,12 +159,12 @@ The log is designed to answer: *what was run, when, by whom (by implication), an
 
 | Activity | Traffic type | Approximate volume |
 |----------|-------------|-------------------|
-| Nmap host sweep | ICMP echo, TCP SYN | ~1 packet per host |
-| Nmap full port scan | TCP SYN to all 65535 ports per host | High — run overnight |
+| Nmap host sweep | **TCP SYN only** to `NMAP_DISCOVERY_PORTS` (no ICMP, no ARP) | ~10 packets per host × port count |
+| Nmap full port scan | TCP SYN to all 65535 ports per host — run as parallel background jobs | High (split across vCPU chunks, rate-capped by `NMAP_MAX_RATE` × 2) |
 | CME SMB sweep | TCP port 445 to all hosts | Moderate |
 | LDAP queries | TCP port 389 to DC | Low |
-| BloodHound collection | LDAP, Kerberos, SMB (DC only) | Moderate |
-| Responder | LLMNR/NBT-NS broadcast responses | Passive, broadcast domain only |
+| BloodHound collection | LDAP, Kerberos, SMB (DC only) | Moderate — scales with `BH_WORKERS` |
+| Responder | LLMNR/NBT-NS broadcast responses | Passive, broadcast domain only; **must stop at `TESTING_WINDOW_END`** |
 | Hashcat | No network traffic (local CPU/GPU only) | None |
 | ZAP baseline scan | HTTP/HTTPS GET requests only | Low-moderate per target |
 | ZAP full scan | HTTP/HTTPS including attack payloads | High per target |
@@ -188,7 +188,7 @@ All output produced by the framework is classified as **CONFIDENTIAL — Interna
 | Captured NTLM hashes | CONFIDENTIAL | `phase3/ad/ntlmv2_all.txt` | Destroy after report delivery |
 | Domain user list | CONFIDENTIAL | `phase1/ad/userlist.txt` | Destroy after report delivery |
 | BloodHound database | CONFIDENTIAL | Docker volume (Neo4j) | Destroy after report delivery |
-| Full port scan results | INTERNAL | `phase1/network/fullscan.xml` | Archive per retention policy |
+| Full port scan results | INTERNAL | `phase1/network/fullscan.gnmap` + `scan_chunks/` | Archive per retention policy |
 | ScoutSuite report | INTERNAL | `phase2/cloud/scoutsuite/` | Archive per retention policy |
 | ZAP scan reports | INTERNAL | `phase2/web/zap/` | Archive per retention policy |
 | Engagement log | INTERNAL | `engagement_log.md` | Archive per retention policy |

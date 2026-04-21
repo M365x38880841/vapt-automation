@@ -46,6 +46,36 @@ set_scout_cmd() {
     fi
 }
 
+# ─── SYSTEM RESOURCE DETECTION ────────────────────────────────────────────────
+# Detects vCPU count and available RAM, then derives tuning constants used across
+# all phase scripts.  Call once at the top of each phase that launches parallel work.
+# Exports: SYS_VCPUS  SYS_RAM_GB  NMAP_MIN_PARALLEL  NMAP_MAX_PARALLEL
+#          HC_WORKLOAD  BH_WORKERS
+detect_system_resources() {
+    SYS_VCPUS=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    SYS_RAM_GB=$(awk '/MemTotal/{printf "%d",$2/1024/1024}' /proc/meminfo 2>/dev/null || echo 8)
+    export SYS_VCPUS SYS_RAM_GB
+
+    # Nmap parallelism — scales with vCPU count; cap at 500 to avoid flooding IDS.
+    NMAP_MIN_PARALLEL=$(( SYS_VCPUS * 10 ))
+    NMAP_MAX_PARALLEL=$(( SYS_VCPUS * 50 ))
+    [[ ${NMAP_MAX_PARALLEL} -gt 500 ]] && NMAP_MAX_PARALLEL=500
+    export NMAP_MIN_PARALLEL NMAP_MAX_PARALLEL
+
+    # Hashcat workload profile: 3 = high (dedicated box), 2 = medium (<4 vCPUs)
+    HC_WORKLOAD=3
+    [[ ${SYS_VCPUS} -lt 4 ]] && HC_WORKLOAD=2
+    export HC_WORKLOAD
+
+    # BloodHound-python collection workers — network-bound, 5×vCPUs is safe
+    BH_WORKERS=$(( SYS_VCPUS * 5 ))
+    [[ ${BH_WORKERS} -gt 40 ]] && BH_WORKERS=40
+    export BH_WORKERS
+
+    log INFO "System: ${SYS_VCPUS} vCPU(s) | ${SYS_RAM_GB} GB RAM"
+    log INFO "Tuned: nmap_parallel=${NMAP_MIN_PARALLEL}–${NMAP_MAX_PARALLEL} | hashcat_workload=-w ${HC_WORKLOAD} | bh_workers=${BH_WORKERS}"
+}
+
 # ─── CME/NXC BINARY DETECTION ─────────────────────────────────────────────────
 # CrackMapExec was renamed to NetExec (nxc) in Kali 2024+. Auto-detect.
 detect_cme() {
@@ -99,8 +129,8 @@ checkpoint() {
     echo -e "${BOLD}${YELLOW}  CHECKPOINT — Human Review Required${RESET}"
     echo -e "${BOLD}  Action:${RESET} ${description}"
     echo -e "${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-    if [[ "$auto" == "--auto-proceed" ]]; then
-        echo -e "${CYAN}  Auto-proceeding (--auto-proceed flag set)${RESET}"
+    if [[ "$auto" == "--auto-proceed" || "${AUTO_APPROVE:-false}" == "true" ]]; then
+        echo -e "${CYAN}  Auto-proceeding (AUTO_APPROVE=true)${RESET}"
         log INFO "Checkpoint auto-proceeded: ${description}"
         return 0
     fi
@@ -116,11 +146,10 @@ checkpoint() {
 # ─── BUSINESS HOURS ENFORCEMENT ───────────────────────────────────────────────
 # Usage:
 #   check_testing_window            — active mode: prompts and may block outside hours
-#   check_testing_window --passive  — passive mode: logs but never blocks
-#                                     Use for offline/non-interactive jobs (Nmap, Hashcat,
-#                                     ScoutSuite) that can safely run overnight. The RoE
-#                                     testing window applies to active attacks, not background
-#                                     enumeration or local cracking jobs.
+#   check_testing_window --passive  — passive mode: logs but never blocks (use for
+#                                     offline/non-network jobs: Hashcat, log parsing).
+#                                     The RoE testing window governs active network
+#                                     attacks; local CPU jobs are not constrained by it.
 check_testing_window() {
     local mode="${1:-active}"
     [[ "${ENFORCE_TESTING_WINDOW:-false}" != "true" ]] && return 0
@@ -135,7 +164,7 @@ check_testing_window() {
     end_min=$(_hm_to_min "${end}")
     if (( cur_min < start_min || cur_min > end_min )); then
         if [[ "$mode" == "--passive" ]]; then
-            log INFO "Outside testing window (${current_time}) — passive job allowed to continue overnight"
+            log INFO "Outside testing window (${current_time}) — offline/passive job continues regardless"
             return 0
         fi
         echo -e "${RED}[SAFETY] Current time ${current_time} is outside testing window (${start}–${end}).${RESET}"
@@ -147,8 +176,8 @@ check_testing_window() {
 }
 
 # ─── BACKGROUND JOB MANAGER ───────────────────────────────────────────────────
-# .bg_jobs — persistent record on disk so the next morning session can check
-# what ran overnight. Format: PID|name|logfile|started_at
+# .bg_jobs — persistent PID record used by --status to track job completion.
+# Format: PID|name|logfile|started_at
 BG_JOBS_FILE="${OUTPUT_BASE_DIR:-${HOME}/vapt}/.bg_jobs"
 BG_JOB_PIDS=()
 BG_JOB_NAMES=()
@@ -156,10 +185,9 @@ BG_JOB_NAMES=()
 bg_run() {
     # Usage: bg_run "job_name" "log_file" command [args...]
     #
-    # Session-persistence: nohup ignores SIGHUP so the job survives terminal close.
-    # disown removes it from bash's job table so bash itself won't kill it on exit.
-    # The PID is also written to BG_JOBS_FILE on disk — the next morning session
-    # can read this file and check which jobs finished overnight.
+    # Session-persistence: nohup ignores SIGHUP so the job continues if the terminal
+    # closes.  disown removes it from bash's job table.  The PID is persisted to
+    # BG_JOBS_FILE so orchestrator --status can track completion at any time.
     local name="$1"; local logfile="$2"; shift 2
     log_cmd "$*"
     nohup "$@" >> "${logfile}" 2>&1 &
@@ -167,11 +195,10 @@ bg_run() {
     disown "$pid"
     BG_JOB_PIDS+=("$pid")
     BG_JOB_NAMES+=("$name")
-    # Persist to disk — survives terminal close
     echo "${pid}|${name}|${logfile}|$(date '+%Y-%m-%d %H:%M:%S')" >> "${BG_JOBS_FILE}"
     log INFO "Background job started: ${name} (PID: ${pid}) → ${logfile}"
-    echo -e "${GREEN}  [BG] ${name} started (PID: ${pid}) — persisted to ${BG_JOBS_FILE}${RESET}"
-    echo -e "${CYAN}       Safe to close terminal — job runs overnight via nohup${RESET}"
+    echo -e "${GREEN}  [BG] ${name} (PID: ${pid}) running — terminal-safe (nohup/disown)${RESET}"
+    echo -e "${CYAN}       Track progress: python3 orchestrator.py --status${RESET}"
 }
 
 wait_for_bg_jobs() {
@@ -209,12 +236,11 @@ status_bg_jobs() {
     done
 }
 
-# morning_briefing — reads the persistent .bg_jobs file and reports overnight status.
-# Run this at the start of the next day's session to see what finished overnight.
+# morning_briefing — reads the persistent .bg_jobs file and reports current status.
 # Usage: morning_briefing
 morning_briefing() {
     echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
-    echo -e "${BOLD}${CYAN}  Morning Briefing — Overnight Background Job Status${RESET}"
+    echo -e "${BOLD}${CYAN}  Background Job Status Report${RESET}"
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
 
     if [[ ! -f "${BG_JOBS_FILE}" ]]; then
@@ -250,7 +276,7 @@ morning_briefing() {
         echo ""
     done < "${BG_JOBS_FILE}"
 
-    echo -e "  ${GREEN}Completed overnight: ${done_count}${RESET}   ${YELLOW}Still running: ${running}${RESET}"
+    echo -e "  ${GREEN}Completed: ${done_count}${RESET}   ${YELLOW}Still running: ${running}${RESET}"
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════════════${RESET}"
     echo -e "  To re-run any failed phase: ${BOLD}python3 orchestrator.py --phase N${RESET}"
     echo -e "  Idempotency: completed steps are skipped automatically.\n"

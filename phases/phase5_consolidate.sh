@@ -18,14 +18,23 @@ mkdir -p "${EVIDENCE_DIR}"/{network,ad,cloud,web,cracked}
 # ─── COLLECT ALL EVIDENCE FILES ──────────────────────────────────────────────
 log INFO "Consolidating evidence files from all phases..."
 
-cp -u "${OUTPUT_BASE_DIR}"/phase1/network/fullscan.* "${EVIDENCE_DIR}/network/" 2>/dev/null && log OK "Nmap full scan copied"
-cp -u "${OUTPUT_BASE_DIR}"/phase1/ad/bloodhound/*.zip "${EVIDENCE_DIR}/ad/"     2>/dev/null && log OK "BloodHound ZIPs copied"
-cp -u "${OUTPUT_BASE_DIR}"/phase2/cloud/scoutsuite/report.html "${EVIDENCE_DIR}/cloud/" 2>/dev/null && log OK "ScoutSuite report copied"
-cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/cracked_*.txt "${EVIDENCE_DIR}/cracked/"  2>/dev/null && log OK "Cracked credentials copied"
-cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/responder_session.log "${EVIDENCE_DIR}/ad/" 2>/dev/null
-cp -u "${OUTPUT_BASE_DIR}"/phase3/cloud/public_blob_poc.txt "${EVIDENCE_DIR}/cloud/" 2>/dev/null
-cp -u "${OUTPUT_BASE_DIR}"/phase4/ad/dcsync_poc.txt "${EVIDENCE_DIR}/ad/" 2>/dev/null
-cp -u "${OUTPUT_BASE_DIR}"/phase4/blast_radius/summary.md "${EVIDENCE_DIR}/" 2>/dev/null
+cp -u "${OUTPUT_BASE_DIR}"/phase1/network/fullscan.* "${EVIDENCE_DIR}/network/" 2>/dev/null \
+    && log OK "Nmap full scan copied" || log WARN "Nmap full scan not yet available — skipping"
+
+cp -u "${OUTPUT_BASE_DIR}"/phase1/ad/bloodhound/*.zip "${EVIDENCE_DIR}/ad/" 2>/dev/null \
+    && log OK "BloodHound ZIPs copied" || log WARN "BloodHound ZIPs not found — skipping"
+
+# ScoutSuite writes per-subscription: scoutsuite/<sub_id>/report.html — use wildcard.
+find "${OUTPUT_BASE_DIR}/phase2/cloud/scoutsuite" -name 'report.html' -exec cp -u {} "${EVIDENCE_DIR}/cloud/" \; 2>/dev/null \
+    && log OK "ScoutSuite report(s) copied" || log WARN "ScoutSuite reports not found — skipping"
+
+cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/cracked_*.txt "${EVIDENCE_DIR}/cracked/" 2>/dev/null \
+    && log OK "Cracked credentials copied" || log WARN "No cracked credential files yet — skipping"
+
+cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/responder_session.log "${EVIDENCE_DIR}/ad/" 2>/dev/null || true
+cp -u "${OUTPUT_BASE_DIR}"/phase3/cloud/public_blob_poc.txt "${EVIDENCE_DIR}/cloud/" 2>/dev/null || true
+cp -u "${OUTPUT_BASE_DIR}"/phase4/ad/dcsync_poc.txt "${EVIDENCE_DIR}/ad/" 2>/dev/null || true
+cp -u "${OUTPUT_BASE_DIR}"/phase4/blast_radius/summary.md "${EVIDENCE_DIR}/" 2>/dev/null || true
 
 # ─── COUNT FINDINGS FROM AUTOMATED OUTPUTS ────────────────────────────────────
 KERB_COUNT=$(grep -c 'krb5tgs'   "${EVIDENCE_DIR}/cracked/cracked_tgs.txt"   2>/dev/null || echo 0)
@@ -195,6 +204,19 @@ done)
 SCAFFOLD_EOF
 
 log OK "Report scaffold generated → ${SCAFFOLD}"
+
+# ─── EVIDENCE INTEGRITY MANIFEST ─────────────────────────────────────────────
+# SHA-256 checksums of all evidence files — proves chain of custody and detects
+# accidental modification before the report is delivered.
+MANIFEST="${REPORT_DIR}/evidence_manifest.sha256"
+log INFO "Generating evidence integrity manifest..."
+if command -v sha256sum &>/dev/null; then
+    find "${EVIDENCE_DIR}" -type f | sort | xargs sha256sum 2>/dev/null > "${MANIFEST}" || true
+    MANIFEST_COUNT=$(wc -l < "${MANIFEST}" 2>/dev/null || echo 0)
+    log OK "Evidence manifest: ${MANIFEST_COUNT} files checksummed → ${MANIFEST}"
+else
+    log WARN "sha256sum not available — evidence integrity manifest skipped"
+fi
 
 echo ""
 echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${RESET}"
