@@ -165,7 +165,7 @@ done
 # ─── AUTO-INSTALL MISSING REQUIRED TOOLS ─────────────────────────────────────
 if [[ ${#MISSING_REQUIRED[@]} -gt 0 ]]; then
     log WARN "Missing required tools: ${MISSING_REQUIRED[*]}"
-    checkpoint "Auto-install missing required tools via apt/pip?"
+    if checkpoint "Auto-install missing required tools via apt/pip?"; then
     sudo apt-get update -qq
     for tool in "${MISSING_REQUIRED[@]}"; do
         case "$tool" in
@@ -214,28 +214,30 @@ if [[ ${#MISSING_REQUIRED[@]} -gt 0 ]]; then
                 log WARN "Don't know how to auto-install: ${tool}" ;;
         esac
     done
+    fi  # end checkpoint gate
 fi
 
 # ─── AUTO-INSTALL OPTIONAL TOOLS ─────────────────────────────────────────────
 if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
     log WARN "Missing optional tools: ${MISSING_OPTIONAL[*]}"
-    checkpoint "Auto-install missing optional tools (Impacket suite + certipy-ad)?"
-    for tool in "${MISSING_OPTIONAL[@]}"; do
-        case "$tool" in
-            impacket-*)
-                pip_install impacket && log OK "Impacket suite installed" || \
-                    log WARN "Impacket install failed — try: pip3 install impacket --break-system-packages"
-                break  # installing impacket covers all impacket-* tools
-                ;;
-            certipy-ad)
-                pip_install certipy-ad && log OK "certipy-ad installed" || \
-                    log WARN "certipy-ad install failed — AD CS checks in Phase 2 will be skipped"
-                ;;
-            msfconsole)
-                log WARN "Metasploit (msfconsole) not auto-installed — install via: sudo apt-get install metasploit-framework"
-                ;;
-        esac
-    done
+    if checkpoint "Auto-install missing optional tools (Impacket suite + certipy-ad)?"; then
+        for tool in "${MISSING_OPTIONAL[@]}"; do
+            case "$tool" in
+                impacket-*)
+                    pip_install impacket && log OK "Impacket suite installed" || \
+                        log WARN "Impacket install failed — try: pip3 install impacket --break-system-packages"
+                    break  # installing impacket covers all impacket-* tools
+                    ;;
+                certipy-ad)
+                    pip_install certipy-ad && log OK "certipy-ad installed" || \
+                        log WARN "certipy-ad install failed — AD CS checks in Phase 2 will be skipped"
+                    ;;
+                msfconsole)
+                    log WARN "Metasploit (msfconsole) not auto-installed — install via: sudo apt-get install metasploit-framework"
+                    ;;
+            esac
+        done
+    fi
 fi
 
 # ─── VERIFY SCOUTSUITE INVOCATION ─────────────────────────────────────────────
@@ -255,19 +257,22 @@ fi
 log INFO "Checking wordlists..."
 if [[ ! -f "${WORDLIST_PRIMARY}" ]]; then
     log WARN "Primary wordlist not found: ${WORDLIST_PRIMARY}"
-    checkpoint "Prepare rockyou.txt wordlist (~60MB)?"
-    mkdir -p "$(dirname "${WORDLIST_PRIMARY}")"
-    if [[ -f /usr/share/wordlists/rockyou.txt.gz ]]; then
-        sudo gunzip /usr/share/wordlists/rockyou.txt.gz
-        log OK "rockyou.txt decompressed"
-    elif sudo apt-get install -y wordlists &>/dev/null 2>&1 && [[ -f /usr/share/wordlists/rockyou.txt.gz ]]; then
-        sudo gunzip /usr/share/wordlists/rockyou.txt.gz
-        log OK "rockyou.txt installed via apt wordlists package"
+    if checkpoint "Prepare rockyou.txt wordlist (~60MB)?"; then
+        mkdir -p "$(dirname "${WORDLIST_PRIMARY}")"
+        if [[ -f /usr/share/wordlists/rockyou.txt.gz ]]; then
+            sudo gunzip /usr/share/wordlists/rockyou.txt.gz
+            log OK "rockyou.txt decompressed"
+        elif sudo apt-get install -y wordlists &>/dev/null 2>&1 && [[ -f /usr/share/wordlists/rockyou.txt.gz ]]; then
+            sudo gunzip /usr/share/wordlists/rockyou.txt.gz
+            log OK "rockyou.txt installed via apt wordlists package"
+        else
+            sudo wget -q -O "${WORDLIST_PRIMARY}.gz" \
+                https://github.com/praetorian-inc/Hob0Rules/raw/master/wordlists/rockyou.txt.gz
+            sudo gunzip "${WORDLIST_PRIMARY}.gz"
+            log OK "rockyou.txt downloaded"
+        fi
     else
-        sudo wget -q -O "${WORDLIST_PRIMARY}.gz" \
-            https://github.com/praetorian-inc/Hob0Rules/raw/master/wordlists/rockyou.txt.gz
-        sudo gunzip "${WORDLIST_PRIMARY}.gz"
-        log OK "rockyou.txt downloaded"
+        log WARN "Wordlist skipped — password cracking in Phase 3 will require manual setup"
     fi
 else
     WCOUNT=$(wc -l < "${WORDLIST_PRIMARY}")
@@ -325,34 +330,37 @@ fi
 if docker compose -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy'; then
     log OK "BloodHound CE stack already running → http://localhost:8080"
 else
-    checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"
-    log INFO "Pulling and starting BloodHound CE stack (first run downloads ~1.5 GB, may take 3–5 min)..."
-    docker compose -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
+    if checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"; then
+        log INFO "Pulling and starting BloodHound CE stack (first run downloads ~1.5 GB, may take 3–5 min)..."
+        docker compose -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
 
-    # ── Wait for BloodHound HTTP endpoint — not just container status ─────────
-    # Container status (healthy/running) reflects Postgres/Neo4j readiness, but
-    # BloodHound itself still needs a few seconds after its deps are healthy.
-    # We poll the /api/version endpoint (returns 200 when the app is serving).
-    log INFO "Waiting for BloodHound CE HTTP endpoint (up to 180s)..."
-    bh_wait=0
-    bh_ready=false
-    while [[ $bh_wait -lt 180 ]]; do
-        if curl -sf --max-time 3 "http://localhost:8080/api/version" &>/dev/null; then
-            bh_ready=true
-            break
+        # ── Wait for BloodHound HTTP endpoint — not just container status ─────────
+        # Container status (healthy/running) reflects Postgres/Neo4j readiness, but
+        # BloodHound itself still needs a few seconds after its deps are healthy.
+        # We poll the /api/version endpoint (returns 200 when the app is serving).
+        log INFO "Waiting for BloodHound CE HTTP endpoint (up to 180s)..."
+        bh_wait=0
+        bh_ready=false
+        while [[ $bh_wait -lt 180 ]]; do
+            if curl -sf --max-time 3 "http://localhost:8080/api/version" &>/dev/null; then
+                bh_ready=true
+                break
+            fi
+            sleep 5; (( bh_wait += 5 ))
+            [[ $(( bh_wait % 30 )) -eq 0 ]] && log INFO "  Still waiting... (${bh_wait}s elapsed)"
+        done
+
+        if $bh_ready; then
+            log OK "BloodHound CE is serving → http://localhost:8080 (${bh_wait}s)"
+        else
+            log WARN "BloodHound CE did not respond within 180s. Check container logs:"
+            log WARN "  docker compose -f ${BHCE_COMPOSE} logs bloodhound | tail -30"
         fi
-        sleep 5; (( bh_wait += 5 ))
-        [[ $(( bh_wait % 30 )) -eq 0 ]] && log INFO "  Still waiting... (${bh_wait}s elapsed)"
-    done
-
-    if $bh_ready; then
-        log OK "BloodHound CE is serving → http://localhost:8080 (${bh_wait}s)"
+        log INFO "Get first-run admin password:"
+        log INFO "  docker compose -f ${BHCE_COMPOSE} logs bloodhound 2>&1 | grep -i 'initial password\|password'"
     else
-        log WARN "BloodHound CE did not respond within 180s. Check container logs:"
-        log WARN "  docker compose -f ${BHCE_COMPOSE} logs bloodhound | tail -30"
+        log WARN "BloodHound CE startup skipped — start manually: docker compose -f ${BHCE_COMPOSE} up -d"
     fi
-    log INFO "Get first-run admin password:"
-    log INFO "  docker compose -f ${BHCE_COMPOSE} logs bloodhound 2>&1 | grep -i 'initial password\|password'"
 fi
 
 # ─── AZURE CLI LOGIN CHECK ────────────────────────────────────────────────────
@@ -362,8 +370,12 @@ if az account show &>/dev/null; then
     log OK "Azure CLI already logged in as: ${ACCOUNT}"
 else
     log WARN "Azure CLI not logged in. Initiating device code login for tenant: ${AZURE_TENANT_ID}"
-    checkpoint "Login to Azure via device code flow?"
-    az login --tenant "${AZURE_TENANT_ID}" --use-device-code
+    if checkpoint "Login to Azure via device code flow?"; then
+        az login --tenant "${AZURE_TENANT_ID}" --use-device-code
+    else
+        log WARN "Azure login skipped — cloud scans in Phase 2 will fail until authenticated."
+        log WARN "Run manually: az login --tenant ${AZURE_TENANT_ID} --use-device-code"
+    fi
 fi
 
 # ─── VALIDATE SUBNET REACHABILITY ────────────────────────────────────────────

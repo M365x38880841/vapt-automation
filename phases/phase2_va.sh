@@ -42,16 +42,17 @@ for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
     SCOUT_DONE_SUB="${SCOUT_REPORT_SUB}/report.html"
     mkdir -p "${SCOUT_REPORT_SUB}"
     if ! skip_if_exists "${SCOUT_DONE_SUB}" "ScoutSuite audit for subscription ${sub_id}" "scoutsuite"; then
-        checkpoint "Launch ScoutSuite audit against subscription ${sub_id} (tenant: ${AZURE_TENANT_ID})?"
-        log INFO "Starting ScoutSuite for ${sub_id} in background (est. 25–45 min)..."
-        bg_run "scoutsuite_${sub_id}" \
-            "${OUT_CLOUD}/scoutsuite_${sub_id}.log" \
-            "${SCOUT_CMD_ARRAY[@]}" azure \
-                --tenant "${AZURE_TENANT_ID}" \
-                --subscription-id "${sub_id}" \
-                --report-dir "${SCOUT_REPORT_SUB}" \
-                --no-browser
-        log INFO "ScoutSuite (${sub_id}) PID: ${BG_JOB_PIDS[-1]}"
+        if checkpoint "Launch ScoutSuite audit against subscription ${sub_id} (tenant: ${AZURE_TENANT_ID})?"; then
+            log INFO "Starting ScoutSuite for ${sub_id} in background (est. 25–45 min)..."
+            bg_run "scoutsuite_${sub_id}" \
+                "${OUT_CLOUD}/scoutsuite_${sub_id}.log" \
+                "${SCOUT_CMD_ARRAY[@]}" azure \
+                    --tenant "${AZURE_TENANT_ID}" \
+                    --subscription-id "${sub_id}" \
+                    --report-dir "${SCOUT_REPORT_SUB}" \
+                    --no-browser
+            log INFO "ScoutSuite (${sub_id}) PID: ${BG_JOB_PIDS[-1]}"
+        fi
     fi
 done
 
@@ -157,9 +158,9 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
 
     # Password policy check
     log INFO "Extracting domain password policy..."
-    log_cmd "${CME_BIN} smb ${DC_IP} -u ... --pass-pol"
+    log_cmd "${CME_BIN} smb ${DC_IP} -u ... -d ${DOMAIN_NAME} --pass-pol"
     "${CME_BIN}" smb "${DC_IP}" \
-        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
+        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --pass-pol \
         2>&1 > "${AD_CHECKS}/password_policy.txt" || true
     log OK "Password policy extracted → ${AD_CHECKS}/password_policy.txt"
@@ -167,14 +168,14 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     # Enumerate shares
     log INFO "Enumerating accessible shares..."
     "${CME_BIN}" smb "${DC_IP}" \
-        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
+        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --shares \
         2>&1 > "${AD_CHECKS}/shares.txt" || true
 
     # Check for accounts with no pre-auth (AS-REP using CME)
     log INFO "Checking admin group members..."
     "${CME_BIN}" smb "${DC_IP}" \
-        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
+        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --groups "Domain Admins" \
         2>&1 > "${AD_CHECKS}/domain_admins.txt" || true
 
@@ -238,10 +239,10 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         log INFO "Running SMB vulnerability checks (ms17-010, nopac, petitpotam)..."
         > "${SMB_VULN_OUT}"
         for module in ms17-010 nopac petitpotam; do
-            log_cmd "${CME_BIN} smb -iL ${LIVE_HOSTS} -M ${module}"
+            log_cmd "${CME_BIN} smb -iL ${LIVE_HOSTS} -d ${DOMAIN_NAME} -M ${module}"
             "${CME_BIN}" smb \
                 -iL "${LIVE_HOSTS}" \
-                -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" \
+                -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
                 -M "${module}" \
                 2>&1 >> "${SMB_VULN_OUT}" || true
         done
@@ -297,7 +298,10 @@ else
                 continue
             fi
 
-            checkpoint "Launch OWASP ZAP ${ZAP_SCAN_MODE:-baseline} scan against ${target}?"
+            if ! checkpoint "Launch OWASP ZAP ${ZAP_SCAN_MODE:-baseline} scan against ${target}?"; then
+                log INFO "ZAP scan skipped for ${target}"
+                continue
+            fi
             log INFO "Starting ZAP background scan: ${target}"
             log_cmd "docker run ... zaproxy ${ZAP_SCRIPT} -t ${target}"
 

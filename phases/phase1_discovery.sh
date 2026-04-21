@@ -78,17 +78,20 @@ fi  # end host_sweep skip gate
 # ─── STEP 1.2 — FULL PORT SCAN (background — runs overnight) ────────────────
 FULLSCAN_OUT="${OUT_NET}/fullscan"
 if ! skip_if_exists "${FULLSCAN_OUT}.xml" "Full port scan" "nmap_fullscan"; then
-    checkpoint "Start full port scan (-p- against ${LIVE_COUNT} hosts). This runs in background and may take 3–5 hours."
-    log INFO "Launching full port scan as background job (overnight-friendly)..."
-    bg_run "nmap_fullscan" \
-        "${OUT_NET}/fullscan.log" \
-        "${NMAP_BIN:-nmap}" \
-            -sS -sV -sC -p- --open \
-            -T"${NMAP_TIMING:-4}" \
-            --min-hostgroup "${NMAP_MIN_HOSTGROUP:-32}" \
-            -iL "${LIVE_HOSTS_MERGED}" \
-            -oA "${FULLSCAN_OUT}"
-    log INFO "Full port scan running in background (PID: ${BG_JOB_PIDS[-1]}). Continuing with other tasks."
+    if checkpoint "Start full port scan (-p- against ${LIVE_COUNT} hosts). This runs in background and may take 3–5 hours."; then
+        log INFO "Launching full port scan as background job (overnight-friendly)..."
+        bg_run "nmap_fullscan" \
+            "${OUT_NET}/fullscan.log" \
+            "${NMAP_BIN:-nmap}" \
+                -sS -sV -sC -p- --open \
+                -T"${NMAP_TIMING:-4}" \
+                --min-hostgroup "${NMAP_MIN_HOSTGROUP:-32}" \
+                -iL "${LIVE_HOSTS_MERGED}" \
+                -oA "${FULLSCAN_OUT}"
+        log INFO "Full port scan running in background (PID: ${BG_JOB_PIDS[-1]}). Continuing with other tasks."
+    else
+        log INFO "Full port scan skipped — run manually when ready: nmap -sS -sV -sC -p- --open -iL ${LIVE_HOSTS_MERGED} -oA ${FULLSCAN_OUT}"
+    fi
 fi
 
 # ─── STEP 1.3 — SMB SWEEP + SIGNING CHECK (background) ──────────────────────
@@ -99,7 +102,7 @@ if ! skip_if_exists "${SMB_OUT}" "CrackMapExec SMB sweep" "smb_sweep"; then
         "${OUT_AD}/smb_sweep.log" \
         bash -c "for subnet in ${TARGET_SUBNETS}; do \
             ${CME_BIN} smb \"\${subnet}\" \
-                -u '${DOMAIN_USER}' -p '${DOMAIN_PASS}' \
+                -u '${DOMAIN_USER}' -p '${DOMAIN_PASS}' -d '${DOMAIN_NAME}' \
                 2>&1; \
         done > '${SMB_OUT}'"
     log INFO "CME SMB sweep running in background."
