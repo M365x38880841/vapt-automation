@@ -21,7 +21,7 @@ services:
     restart: unless-stopped
 
   app-db:
-    image: docker.io/library/postgres:13.2
+    image: docker.io/library/postgres:16
     environment:
       POSTGRES_USER: bloodhound
       POSTGRES_PASSWORD: bloodhoundcommunityedition
@@ -58,3 +58,9 @@ services:
 volumes:
   postgres-data:
   neo4j-data:
+
+networks:
+  default:
+    driver: bridge
+    driver_opts:
+      com.docker.network.enable_ipv6: "false"
