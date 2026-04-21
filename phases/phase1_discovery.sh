@@ -73,7 +73,17 @@ log OK "Host sweep complete. Live hosts found: ${LIVE_COUNT} → ${LIVE_HOSTS_ME
 
 fi  # end host_sweep skip gate
 
-[[ "${LIVE_COUNT:-0}" -eq 0 ]] && { log ERROR "No live hosts found. Check subnets and interface."; exit 1; }
+# Only abort on zero live hosts if the full port scan is going to run — it is
+# the only step that requires -iL "${LIVE_HOSTS_MERGED}". Steps like smb_sweep,
+# ldap*, bloodhound, roadrecon and azure all target subnets or DC_IP directly.
+if [[ "${LIVE_COUNT:-0}" -eq 0 ]]; then
+    if ! _step_is_skipped "nmap_fullscan"; then
+        log ERROR "No live hosts found — full port scan needs a live hosts list. Check TARGET_SUBNETS and ATTACKER_INTERFACE."
+        exit 1
+    else
+        log WARN "No live hosts in cache yet — steps that require a live hosts list will be skipped automatically."
+    fi
+fi
 
 # ─── STEP 1.2 — FULL PORT SCAN (background — runs overnight) ────────────────
 FULLSCAN_OUT="${OUT_NET}/fullscan"
