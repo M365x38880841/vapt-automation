@@ -3,11 +3,11 @@
   "bind_addr": "0.0.0.0:8080",
   "jwt_signing_key": "vapt-bhce-replace-with-random-32char-string",
   "database": {
-    "connection": "user=bloodhound password=bloodhoundcommunityedition dbname=bloodhound host=app-db"
+    "connection": "user=bloodhound password=bloodhoundcommunityedition dbname=bloodhound host=172.28.1.2"
   },
   "graph_driver": "neo4j",
   "neo4j": {
-    "neo4j_connection": "bolt://graph-db:7687",
+    "neo4j_connection": "bolt://172.28.1.3:7687",
     "neo4j_user": "neo4j",
     "neo4j_secret": "bloodhoundcommunityedition"
   },
