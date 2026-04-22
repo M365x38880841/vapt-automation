@@ -104,15 +104,22 @@ https://download.docker.com/linux/debian bookworm stable" \
         docker_ok=true
     fi
 
-    # ── Compose plugin check (independent of whether we just installed Docker) ─
-    # docker compose (v2 plugin) is required; docker-compose (v1 binary) is not enough.
-    if ! docker compose version &>/dev/null 2>&1; then
-        log WARN "docker compose plugin (v2) missing — installing now"
+    # ── Compose availability check ───────────────────────────────────────────
+    # Prefer v2 plugin (docker compose); fall back to v1 standalone (docker-compose).
+    # detect_docker_compose() in common.sh already set DC[]; re-detect after any install.
+    if docker compose version &>/dev/null 2>&1; then
+        log OK "docker compose (v2 plugin): $(docker compose version --short 2>/dev/null || echo 'ok')"
+    elif command -v docker-compose &>/dev/null; then
+        log OK "docker-compose (v1 standalone): $(docker-compose version --short 2>/dev/null || echo 'ok')"
+        log WARN "docker-compose v1 is deprecated. Install the v2 plugin when possible: sudo apt-get install docker-compose-plugin"
+    else
+        log WARN "No compose tool found — attempting to install docker-compose-plugin..."
         sudo apt-get install -y docker-compose-plugin 2>/dev/null \
             || log ERROR "Could not install docker-compose-plugin. Run: sudo apt-get install docker-compose-plugin"
-    else
-        log OK "docker compose plugin: $(docker compose version --short 2>/dev/null || echo 'ok')"
     fi
+    # Re-detect after possible install so DC[] is correct for this session
+    detect_docker_compose
+    log INFO "Docker Compose command: ${DC[*]}"
 
     # ── Add user to docker group if not already a member ────────────────────
     if ! groups "$USER" 2>/dev/null | grep -q '\bdocker\b'; then
@@ -327,12 +334,12 @@ if grep -q "${PLACEHOLDER}" "${BHCE_CONFIG}" 2>/dev/null; then
 fi
 
 # Check if stack is already running (covers both fresh start and resume after reboot)
-if docker compose -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy'; then
+if "${DC[@]}" -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy'; then
     log OK "BloodHound CE stack already running → http://localhost:8080"
 else
     if checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"; then
         log INFO "Pulling and starting BloodHound CE stack (first run downloads ~1.5 GB, may take 3–5 min)..."
-        docker compose -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
+        "${DC[@]}" -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
 
         # ── Wait for BloodHound HTTP endpoint — not just container status ─────────
         # Container status (healthy/running) reflects Postgres/Neo4j readiness, but
@@ -354,12 +361,12 @@ else
             log OK "BloodHound CE is serving → http://localhost:8080 (${bh_wait}s)"
         else
             log WARN "BloodHound CE did not respond within 180s. Check container logs:"
-            log WARN "  docker compose -f ${BHCE_COMPOSE} logs bloodhound | tail -30"
+            log WARN "  ${DC[*]} -f ${BHCE_COMPOSE} logs bloodhound | tail -30"
         fi
         log INFO "Get first-run admin password:"
-        log INFO "  docker compose -f ${BHCE_COMPOSE} logs bloodhound 2>&1 | grep -i 'initial password\|password'"
+        log INFO "  ${DC[*]} -f ${BHCE_COMPOSE} logs bloodhound 2>&1 | grep -i 'initial password\|password'"
     else
-        log WARN "BloodHound CE startup skipped — start manually: docker compose -f ${BHCE_COMPOSE} up -d"
+        log WARN "BloodHound CE startup skipped — start manually: ${DC[*]} -f ${BHCE_COMPOSE} up -d"
     fi
 fi
 
@@ -414,6 +421,6 @@ echo -e "    • Signed RoE from all 6 parties"
 echo -e "    • Asset inventory from Networking + Cloud Platform teams"
 echo -e "    • Confirm testing window with Management Sponsors"
 echo -e "    • Emergency stop contact confirmed"
-echo -e "    • BloodHound CE first-run password → docker compose -f tools/bloodhound-ce/docker-compose.yml logs bloodhound | grep -i password"
+echo -e "    • BloodHound CE first-run password → ${DC[*]} -f tools/bloodhound-ce/docker-compose.yml logs bloodhound | grep -i password"
 echo ""
 log OK "Phase 0 automated setup complete"

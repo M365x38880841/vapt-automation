@@ -344,7 +344,9 @@ All output is written under `OUTPUT_BASE_DIR` (default: `~/vapt/`). Phase 0 crea
 
 ## BloodHound CE
 
-BloodHound Community Edition runs as a Docker Compose stack (started automatically by Phase 0):
+BloodHound Community Edition runs as a Docker Compose stack (started automatically by Phase 0).
+
+> **Compose command:** use `docker compose` (v2 plugin) if available, otherwise `docker-compose` (v1). Phase 0 detects which is present. For manual commands below, substitute accordingly.
 
 ```bash
 # Check stack status

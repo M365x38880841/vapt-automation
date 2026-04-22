@@ -167,6 +167,47 @@ STEP_REGISTRY = {
     },
 }
 
+# ─── STEP CREDENTIAL REQUIREMENTS ────────────────────────────────────────────
+# Maps each step key to the credentials it actually needs at runtime.
+# Used to filter credential prompts when --only selects a subset of steps —
+# so running --only host_sweep,nmap_fullscan never asks for DOMAIN_USER/PASS.
+STEP_CRED_REQUIREMENTS: dict[int, dict[str, list[str]]] = {
+    1: {
+        "host_sweep":      [],
+        "nmap_fullscan":   [],
+        "smb_sweep":       ["DOMAIN_USER", "DOMAIN_PASS"],
+        "ldap_banner":     [],
+        "ldap_users":      ["DOMAIN_USER", "DOMAIN_PASS"],
+        "null_session":    [],
+        "bloodhound":      ["DOMAIN_USER", "DOMAIN_PASS"],
+        "roadrecon":       ["DOMAIN_USER", "DOMAIN_PASS"],
+        "azure_inventory": [],
+    },
+    2: {
+        "scoutsuite":     [],
+        "azure_security": [],
+        "ad_checks":      ["DOMAIN_USER", "DOMAIN_PASS"],
+        "zap":            [],
+        "nessus":         ["NESSUS_USER", "NESSUS_PASS", "NESSUS_URL"],
+    },
+    3: {
+        "responder":     [],
+        "kerberoast":    ["DOMAIN_USER", "DOMAIN_PASS"],
+        "asrep":         ["DOMAIN_USER", "DOMAIN_PASS"],
+        "hashcat":       [],
+        "ntlm_relay":    [],
+        "pth_sweep":     ["OBTAINED_HASH"],
+        "azure_storage": [],
+    },
+    4: {
+        "sam_sweep":          ["OBTAINED_HASH"],
+        "lateral_move":       ["OBTAINED_HASH"],
+        "dcsync":             ["OBTAINED_HASH"],
+        "azure_blast_radius": [],
+        "blast_summary":      [],
+    },
+}
+
 # ─── CREDENTIAL REGISTRY ──────────────────────────────────────────────────────
 CREDENTIAL_PROMPTS = {
     "DOMAIN_USER":   "Domain username (e.g. testuser)",
@@ -582,10 +623,35 @@ def main():
         warn("AUTO-APPROVE mode active — all checkpoints will be bypassed.")
 
     # ── Collect all credentials needed upfront
-    all_secrets_needed = set()
+    # When --only is set, only ask for credentials that those specific steps actually use.
+    # When --skip is set, drop credentials only needed by the skipped steps.
+    # Fall back to the full phase-level secrets_needed list for unregistered steps.
+    all_secrets_needed: set[str] = set()
     for num in phases_to_run:
-        if num in PHASES:
-            all_secrets_needed.update(PHASES[num].get("secrets_needed", []))
+        if num not in PHASES:
+            continue
+        phase_secrets = set(PHASES[num].get("secrets_needed", []))
+        step_creds = STEP_CRED_REQUIREMENTS.get(num, {})
+
+        if args.only:
+            only_steps = {s.strip() for s in args.only.split(",")}
+            for step in only_steps:
+                if step in step_creds:
+                    all_secrets_needed.update(step_creds[step])
+                else:
+                    # Unknown step key — fall back to full phase credentials
+                    all_secrets_needed.update(phase_secrets)
+        elif args.skip:
+            skip_steps = {s.strip() for s in args.skip.split(",")}
+            # Collect creds for every step that is NOT being skipped
+            if step_creds:
+                for step, creds_needed in step_creds.items():
+                    if step not in skip_steps:
+                        all_secrets_needed.update(creds_needed)
+            else:
+                all_secrets_needed.update(phase_secrets)
+        else:
+            all_secrets_needed.update(phase_secrets)
 
     creds = {}
     if all_secrets_needed and not args.dry_run:

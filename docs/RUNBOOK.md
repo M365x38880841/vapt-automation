@@ -599,18 +599,34 @@ ls /etc/apt/keyrings/docker.gpg
 python3 orchestrator.py --phase 0
 ```
 
-### `docker compose` not found (only `docker-compose`)
+### `docker compose` not found / compose errors
 
-**Symptom:** `docker compose version` fails; `docker-compose --version` works.
+**Symptom A:** `docker compose version` fails but `docker-compose --version` works.
 
-**Cause:** docker-compose v1 (standalone binary) is installed, not the v2 plugin.
+**Cause:** Docker CE compose v2 plugin is not installed. The framework auto-detects and falls back to `docker-compose` v1 via `detect_docker_compose()` in `lib/common.sh`. v1 is functional but deprecated.
+
+**Fix (preferred):**
+```bash
+sudo apt-get install docker-compose-plugin
+docker compose version   # should now work
+```
+
+**Symptom B:** Both `docker compose` and `docker-compose` fail with "Permission denied".
+
+**Cause:** Current user is not in the `docker` group (or group membership not yet active in this session).
 
 **Fix:**
 ```bash
-sudo apt-get install docker-compose-plugin
-# Verify
-docker compose version
+sudo usermod -aG docker "$USER"
+newgrp docker   # apply without logging out
+docker ps       # should work without sudo
 ```
+
+**Symptom C:** Phase 0 is using the Ubuntu-packaged Docker (`docker.io`) instead of Docker CE.
+
+**Check:** `apt-cache policy docker-ce` — if "none" is shown, Docker CE is not installed.
+
+**Fix:** Re-run Phase 0 — `ensure_docker()` installs Docker CE from the upstream repo and removes `docker.io`.
 
 ### pip_install fails for a tool
 
@@ -660,6 +676,26 @@ Add `export PATH="${HOME}/.local/bin:${PATH}"` to `~/.bashrc` or `~/.zshrc` perm
 **Cause:** `ntlmv2_all.txt` is empty — Responder has not captured any hashes yet.
 
 **Fix:** This is expected if Responder just started. Wait for hashes to accumulate, then re-run Phase 3.
+
+### BloodHound CE: "graph migration error: too many colons in address"
+
+**Symptom:** `bloodhound-1` container log shows a graph migration error with "too many colons in address" or similar connectivity failure. Neo4j bolt IS listening (confirmed via `ss -tlnp | grep 7687`).
+
+**Root cause:** Neo4j 4.4 advertises its bolt address to clients as part of the routing table handshake. If `NEO4J_dbms_connector_bolt_advertised__address` is set to a hostname (`graph-db`), Docker's internal DNS can resolve that hostname to an IPv6-mapped address (e.g. `::ffff:172.28.1.3`) even on `enable_ipv6: false` networks. BloodHound's Go bolt client receives this address and constructs `bolt://::ffff:172.28.1.3:7687` — Go's `net.Dial` rejects this with "too many colons in address" because the IPv6 host is not wrapped in brackets.
+
+**Fix:** The `docker-compose.yml` already sets the advertised address to the explicit static IPv4 (`172.28.1.3:7687`). If you see this error it means the container was created from an older config and needs to be **fully recreated** (not just restarted):
+
+```bash
+# Full teardown and recreate — this picks up the fixed advertised address
+docker-compose -f tools/bloodhound-ce/docker-compose.yml down
+docker-compose -f tools/bloodhound-ce/docker-compose.yml up -d
+
+# Verify Neo4j is advertising the correct IPv4 address
+docker-compose -f tools/bloodhound-ce/docker-compose.yml logs graph-db 2>&1 \
+    | grep -i 'bolt\|advertis'
+```
+
+> **Important:** `docker restart` or `docker compose restart` does NOT re-apply environment variable changes — only `down` + `up -d` recreates the container with the new config.
 
 ### BloodHound CE cannot be reached at http://localhost:8080
 

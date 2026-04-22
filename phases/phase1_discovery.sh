@@ -17,7 +17,21 @@ detect_system_resources
 
 # ─── RUNTIME REQUIREMENTS ────────────────────────────────────────────────────
 require_var "DOMAIN_NAME"; require_var "DC_IP"; require_var "TARGET_SUBNETS"
-require_var "ATTACKER_INTERFACE"; require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+require_var "ATTACKER_INTERFACE"
+
+# Domain credentials only required by steps that authenticate to AD.
+# Skipped when --only selects network-only steps (host_sweep, nmap_fullscan).
+_needs_domain_creds=false
+for _cred_step in smb_sweep ldap_banner ldap_users null_session bloodhound roadrecon; do
+    if ! _step_is_skipped "${_cred_step}"; then
+        _needs_domain_creds=true; break
+    fi
+done
+if [[ "${_needs_domain_creds}" == "true" ]]; then
+    require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+fi
+unset _cred_step _needs_domain_creds
+
 detect_cme
 
 OUT_NET="$(phase_dir phase1 network)"

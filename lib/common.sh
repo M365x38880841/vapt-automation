@@ -4,6 +4,25 @@
 # Source this at the top of every phase script: source "$(dirname "$0")/../lib/common.sh"
 # ============================================================================
 
+# ─── DOCKER COMPOSE WRAPPER ───────────────────────────────────────────────────
+# Resolves the correct docker compose invocation at runtime.
+# - Prefers   "docker compose" (v2 plugin — docker-ce + docker-compose-plugin)
+# - Falls back "docker-compose" (v1 standalone — older apt/pip installs)
+# Call as: "${DC[@]}" -f file.yml up -d
+# Exported so subshells (bg_run jobs) inherit it.
+detect_docker_compose() {
+    if docker compose version &>/dev/null 2>&1; then
+        DC=( docker compose )
+    elif command -v docker-compose &>/dev/null; then
+        DC=( docker-compose )
+    else
+        DC=( docker compose )   # will fail with a clear "unknown command" message
+    fi
+    export DC
+}
+# Auto-detect on source so every phase that sources common.sh gets DC immediately.
+detect_docker_compose
+
 # ─── COLOURS ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
@@ -209,7 +228,9 @@ wait_for_bg_jobs() {
         local name="${BG_JOB_NAMES[$i]}"
         if kill -0 "$pid" 2>/dev/null; then
             echo -e "  ${YELLOW}⏳ Waiting for: ${name} (PID: ${pid})${RESET}"
-            wait "$pid" 2>/dev/null || true  # disowned jobs may not be waitable
+            # Poll with kill -0 instead of `wait` — disowned jobs are removed from
+            # bash's job table so `wait $pid` returns immediately without blocking.
+            while kill -0 "$pid" 2>/dev/null; do sleep 2; done
             log OK "${name} completed"
         else
             log OK "${name} already finished (PID: ${pid})"
