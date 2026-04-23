@@ -392,10 +392,13 @@ require_tool() {
 
 require_var() {
     local var_name="$1"
-    [[ -z "${!var_name:-}" ]] && {
+    # if/fi ensures the function returns 0 when the var IS set.
+    # The && form returns 1 (from the [[ ]] test) when the var is present,
+    # which trips set -e in the caller even though nothing is wrong.
+    if [[ -z "${!var_name:-}" ]]; then
         log ERROR "Required config variable not set: ${var_name}. Check config.env."
         exit 1
-    }
+    fi
 }
 
 require_file() {
