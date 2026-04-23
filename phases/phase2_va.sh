@@ -18,8 +18,33 @@ source "${SCRIPT_DIR}/../lib/common.sh"
 log PHASE "Phase 2 — Vulnerability Assessment"
 check_testing_window
 
-require_var "DOMAIN_NAME"; require_var "DC_IP"; require_var "AZURE_TENANT_ID"
-require_var "AZURE_SUBSCRIPTION_IDS"; require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+require_var "DOMAIN_NAME"; require_var "DC_IP"
+
+# Conditional credential / cloud-var requirements.
+# Pre-flight probe: inspect each step's skip state QUIETLY (no SKIP log lines
+# emitted — those fire later at the real call sites).  Only require the
+# variables the selected steps will actually use.
+_needs_domain_creds=false
+for _cred_step in ad_checks; do
+    if ! _step_is_skipped "${_cred_step}" quiet; then
+        _needs_domain_creds=true; break
+    fi
+done
+_needs_cloud_vars=false
+for _cloud_step in scoutsuite azure_security; do
+    if ! _step_is_skipped "${_cloud_step}" quiet; then
+        _needs_cloud_vars=true; break
+    fi
+done
+
+if [[ "${_needs_domain_creds}" == "true" ]]; then
+    require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+fi
+if [[ "${_needs_cloud_vars}" == "true" ]]; then
+    require_var "AZURE_TENANT_ID"; require_var "AZURE_SUBSCRIPTION_IDS"
+fi
+unset _cred_step _cloud_step _needs_domain_creds _needs_cloud_vars
+
 detect_cme
 set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
 
@@ -30,13 +55,25 @@ OUT_NET="${OUTPUT_BASE_DIR}/phase2/network"
 mkdir -p "${OUT_AD}" "${OUT_CLOUD}" "${OUT_WEB}" "${OUT_NET}"
 
 LIVE_HOSTS="${OUTPUT_BASE_DIR}/phase1/network/live_hosts_all.txt"
-require_file "${LIVE_HOSTS}"
+# LIVE_HOSTS is consumed by SMB vuln checks inside the ad_checks step.
+# Only require it when ad_checks will actually run — cloud-only runs should
+# not demand a Phase 1 output file.
+if ! _step_is_skipped "ad_checks" quiet; then
+    require_file "${LIVE_HOSTS}"
+fi
 
 # ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background — one job per subscription) ─
 # Runs against ALL subscriptions, not just the first one.
 SCOUT_REPORT_DIR="${OUT_CLOUD}/scoutsuite"
 mkdir -p "${SCOUT_REPORT_DIR}"
 
+# Skip the entire scoutsuite block if scoutsuite is excluded OR if no
+# subscription IDs are configured — `for x in ${UNSET}` aborts under `set -u`.
+if _step_is_skipped "scoutsuite" quiet; then
+    log INFO "Skipping: scoutsuite"
+elif [[ -z "${AZURE_SUBSCRIPTION_IDS:-}" ]]; then
+    log WARN "AZURE_SUBSCRIPTION_IDS not set — scoutsuite skipped."
+else
 for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
     SCOUT_REPORT_SUB="${SCOUT_REPORT_DIR}/${sub_id}"
     SCOUT_DONE_SUB="${SCOUT_REPORT_SUB}/report.html"
@@ -55,6 +92,7 @@ for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
         fi
     fi
 done
+fi  # end scoutsuite + AZURE_SUBSCRIPTION_IDS guard
 
 # ─── STEP 2.2 — AZURE SECURITY CHECKS (background — parallel set) ────────────
 AZ_SEC="${OUT_CLOUD}/security_checks"
@@ -140,7 +178,12 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         "${DOMAIN_NAME}/${DOMAIN_USER}:${DOMAIN_PASS}" \
         -dc-ip "${DC_IP}" \
         2>&1 > "${AD_CHECKS}/kerberoastable_accounts.txt" || true
-    KERB_COUNT=$(grep -c 'ServicePrincipalName' "${AD_CHECKS}/kerberoastable_accounts.txt" 2>/dev/null || echo 0)
+    # `grep -c` prints "0" and exits 1 on no-match, so `|| echo 0` double-counts
+    # the stdout; strip non-digits so the value is a safe scalar for downstream
+    # arithmetic under `set -e`.
+    KERB_COUNT=$(grep -c 'ServicePrincipalName' "${AD_CHECKS}/kerberoastable_accounts.txt" 2>/dev/null || true)
+    KERB_COUNT="${KERB_COUNT//[^0-9]/}"
+    KERB_COUNT="${KERB_COUNT:-0}"
     log OK "Kerberoastable accounts found: ${KERB_COUNT}"
 
     # AS-REP roastable accounts check
@@ -153,7 +196,9 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         -dc-ip "${DC_IP}" \
         -format hashcat \
         2>&1 > "${AD_CHECKS}/asrep_accounts.txt" || true
-    ASREP_COUNT=$(grep -c 'krb5asrep' "${AD_CHECKS}/asrep_accounts.txt" 2>/dev/null || echo 0)
+    ASREP_COUNT=$(grep -c 'krb5asrep' "${AD_CHECKS}/asrep_accounts.txt" 2>/dev/null || true)
+    ASREP_COUNT="${ASREP_COUNT//[^0-9]/}"
+    ASREP_COUNT="${ASREP_COUNT:-0}"
     log OK "AS-REP Roastable accounts found: ${ASREP_COUNT}"
 
     # Password policy check
@@ -188,7 +233,9 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=524288))' \
         sAMAccountName dNSHostName \
         2>&1 > "${AD_CHECKS}/unconstrained_delegation.txt" || true
-    UNCON_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/unconstrained_delegation.txt" 2>/dev/null || echo 0)
+    UNCON_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/unconstrained_delegation.txt" 2>/dev/null || true)
+    UNCON_COUNT="${UNCON_COUNT//[^0-9]/}"
+    UNCON_COUNT="${UNCON_COUNT:-0}"
     [[ "${UNCON_COUNT}" -gt 0 ]] && \
         log WARN "FINDING: ${UNCON_COUNT} computer(s) with unconstrained delegation — see ${AD_CHECKS}/unconstrained_delegation.txt" || \
         log OK "No unconstrained delegation computers found (excluding DCs)"
@@ -202,7 +249,9 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         '(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=65536))' \
         sAMAccountName userAccountControl \
         2>&1 > "${AD_CHECKS}/pwd_never_expires.txt" || true
-    PNE_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/pwd_never_expires.txt" 2>/dev/null || echo 0)
+    PNE_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/pwd_never_expires.txt" 2>/dev/null || true)
+    PNE_COUNT="${PNE_COUNT//[^0-9]/}"
+    PNE_COUNT="${PNE_COUNT:-0}"
     [[ "${PNE_COUNT}" -gt 0 ]] && \
         log WARN "FINDING: ${PNE_COUNT} account(s) with 'password never expires'" || \
         log OK "No password-never-expires accounts found"
@@ -224,7 +273,9 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
                 -vulnerable \
                 -output "${ADCS_OUT}/adcs" \
                 2>&1 | tee "${ADCS_OUT}/adcs_find.txt" || true
-            ADCS_VULN=$(grep -c 'ESC[0-9]\|Enabled.*True\|Client Authentication' "${ADCS_OUT}/adcs_find.txt" 2>/dev/null || echo 0)
+            ADCS_VULN=$(grep -c 'ESC[0-9]\|Enabled.*True\|Client Authentication' "${ADCS_OUT}/adcs_find.txt" 2>/dev/null || true)
+            ADCS_VULN="${ADCS_VULN//[^0-9]/}"
+            ADCS_VULN="${ADCS_VULN:-0}"
             [[ "${ADCS_VULN}" -gt 0 ]] && \
                 log WARN "FINDING: ${ADCS_VULN} potential AD CS misconfiguration(s) — review ${ADCS_OUT}/adcs_find.txt" || \
                 log OK "No obvious AD CS ESC misconfigurations detected"
@@ -246,7 +297,9 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
                 -M "${module}" \
                 2>&1 >> "${SMB_VULN_OUT}" || true
         done
-        VULN_HITS=$(grep -ci 'vulnerable\|VULNERABLE' "${SMB_VULN_OUT}" 2>/dev/null || echo 0)
+        VULN_HITS=$(grep -ci 'vulnerable\|VULNERABLE' "${SMB_VULN_OUT}" 2>/dev/null || true)
+        VULN_HITS="${VULN_HITS//[^0-9]/}"
+        VULN_HITS="${VULN_HITS:-0}"
         [[ "${VULN_HITS}" -gt 0 ]] && \
             log WARN "FINDING: ${VULN_HITS} SMB vulnerability module hit(s) → ${SMB_VULN_OUT}" || \
             log OK "No SMB vulnerability module hits detected"

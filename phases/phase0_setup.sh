@@ -282,7 +282,11 @@ if [[ ! -f "${WORDLIST_PRIMARY}" ]]; then
         log WARN "Wordlist skipped — password cracking in Phase 3 will require manual setup"
     fi
 else
-    WCOUNT=$(wc -l < "${WORDLIST_PRIMARY}")
+    # `wc -l` prefixes its count with whitespace on BSD; strip to digits so the
+    # display is clean and arithmetic comparisons can't choke under `set -e`.
+    WCOUNT=$(wc -l < "${WORDLIST_PRIMARY}" 2>/dev/null || echo 0)
+    WCOUNT="${WCOUNT//[^0-9]/}"
+    WCOUNT="${WCOUNT:-0}"
     log OK "Primary wordlist ready: ${WORDLIST_PRIMARY} (${WCOUNT} lines)"
 fi
 
@@ -303,7 +307,9 @@ if [[ ! -f "${CORP_WORDLIST}" ]]; then
             done
         done
     } > "${CORP_WORDLIST}"
-    CCOUNT=$(wc -l < "${CORP_WORDLIST}")
+    CCOUNT=$(wc -l < "${CORP_WORDLIST}" 2>/dev/null || echo 0)
+    CCOUNT="${CCOUNT//[^0-9]/}"
+    CCOUNT="${CCOUNT:-0}"
     log OK "Corporate pattern wordlist generated: ${CORP_WORDLIST} (${CCOUNT} entries)"
 fi
 export WORDLIST_CORPORATE="${CORP_WORDLIST}"
@@ -373,8 +379,11 @@ fi
 # ─── AZURE CLI LOGIN CHECK ────────────────────────────────────────────────────
 log INFO "Checking Azure CLI login state..."
 if az account show &>/dev/null; then
-    ACCOUNT=$(az account show --query 'user.name' -o tsv 2>/dev/null)
-    log OK "Azure CLI already logged in as: ${ACCOUNT}"
+    # `|| echo unknown` gives a deterministic non-empty value so the log line
+    # reads cleanly even when the query field is missing (older CLI versions
+    # sometimes return empty string for service-principal logins).
+    ACCOUNT=$(az account show --query 'user.name' -o tsv 2>/dev/null || echo unknown)
+    log OK "Azure CLI already logged in as: ${ACCOUNT:-unknown}"
 else
     log WARN "Azure CLI not logged in. Initiating device code login for tenant: ${AZURE_TENANT_ID}"
     if checkpoint "Login to Azure via device code flow?"; then

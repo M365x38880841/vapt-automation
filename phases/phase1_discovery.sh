@@ -21,9 +21,13 @@ require_var "ATTACKER_INTERFACE"
 
 # Domain credentials only required by steps that authenticate to AD.
 # Skipped when --only selects network-only steps (host_sweep, nmap_fullscan).
+# Pass "quiet" so this pre-flight probe does not log a SKIP line for every
+# inspected step — those lines would appear before the real step is reached.
+# ldap_banner itself does not need creds (nmap script is anonymous) but is
+# kept in the list for backwards-compat with earlier cred-gating logic.
 _needs_domain_creds=false
-for _cred_step in smb_sweep ldap_banner ldap_users null_session bloodhound roadrecon; do
-    if ! _step_is_skipped "${_cred_step}"; then
+for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon; do
+    if ! _step_is_skipped "${_cred_step}" quiet; then
         _needs_domain_creds=true; break
     fi
 done
@@ -77,6 +81,9 @@ if _step_is_skipped "host_sweep"; then
     done
     sort -u "${LIVE_HOSTS_MERGED}" -o "${LIVE_HOSTS_MERGED}" 2>/dev/null || true
     LIVE_COUNT=$(wc -l < "${LIVE_HOSTS_MERGED}" 2>/dev/null || echo 0)
+    # Sanitise any leading whitespace from `wc -l` output so arithmetic compares work.
+    LIVE_COUNT="${LIVE_COUNT//[^0-9]/}"
+    LIVE_COUNT="${LIVE_COUNT:-0}"
     log INFO "host_sweep skipped — using cached live hosts (${LIVE_COUNT} hosts)"
 else
 
@@ -117,10 +124,21 @@ log OK "TCP host sweep complete — validated live hosts: ${LIVE_COUNT} → ${LI
 
 fi  # end host_sweep skip gate
 
-if [[ "${LIVE_COUNT:-0}" -eq 0 ]]; then
-    if ! _step_is_skipped "nmap_fullscan"; then
-        log ERROR "No live hosts found. Verify TARGET_SUBNETS and that NMAP_DISCOVERY_PORTS matches your environment."
-        exit 1
+# Strip any whitespace that `wc -l` may have emitted (BSD wc pads with spaces).
+LIVE_COUNT="${LIVE_COUNT//[^0-9]/}"
+LIVE_COUNT="${LIVE_COUNT:-0}"
+
+if [[ "${LIVE_COUNT}" -eq 0 ]]; then
+    # Skip-aware behaviour:
+    #   • If the user is running ONLY host_sweep (no downstream scans), a 0-host
+    #     result is informational, not fatal — they can re-target and retry.
+    #   • If nmap_fullscan is queued to run, we need live hosts, so warn hard
+    #     but still give the user a chance to exit cleanly without set -e tripping.
+    #   • If nmap_fullscan is skipped via --skip or not in --only, carry on so
+    #     any downstream AD / cloud steps still execute.
+    if ! _step_is_skipped "nmap_fullscan" quiet; then
+        log WARN "No live hosts found for full-port scan. Verify TARGET_SUBNETS and NMAP_DISCOVERY_PORTS."
+        log WARN "Full port scan will be skipped automatically — re-run Phase 1 after fixing discovery."
     else
         log WARN "No cached live hosts — downstream steps requiring the host list will skip automatically."
     fi
@@ -146,7 +164,10 @@ if [[ -d "${CHUNK_DIR}" ]] && ls "${CHUNK_DIR}"/fullscan_chunk_*.gnmap &>/dev/nu
 fi
 
 if ! skip_if_exists "${FULLSCAN_OUT}.gnmap" "Full port scan" "nmap_fullscan"; then
-    if checkpoint "Start full TCP port scan (-p-) against ${LIVE_COUNT} validated hosts? (${SYS_VCPUS} parallel jobs on ${SYS_VCPUS}-vCPU system)"; then
+    if [[ "${LIVE_COUNT}" -eq 0 ]]; then
+        log WARN "Full port scan requires a non-empty live hosts list. Skipping nmap_fullscan."
+        log INFO "Resolve TARGET_SUBNETS / NMAP_DISCOVERY_PORTS, then re-run: python3 orchestrator.py --phase 1 --only host_sweep,nmap_fullscan"
+    elif checkpoint "Start full TCP port scan (-p-) against ${LIVE_COUNT} validated hosts? (${SYS_VCPUS} parallel jobs on ${SYS_VCPUS}-vCPU system)"; then
 
         mkdir -p "${CHUNK_DIR}"
         SCAN_RATE=$(( ${NMAP_MAX_RATE:-500} * 2 ))  # aggressive on confirmed live hosts
@@ -395,9 +416,17 @@ if [[ "${SPRAY_ENABLED:-false}" != "true" ]]; then
     log INFO "Password spray disabled (SPRAY_ENABLED=false). Set SPRAY_ENABLED=true in config.env to enable."
 else
     SPRAY_OUT="${OUT_AD}/spray_results.txt"
-    if skip_if_exists "${SPRAY_OUT}" "Password spray results" "host_sweep"; then
+    # Previously this gate was keyed to "host_sweep" which was incorrect — it meant
+    # that with --only host_sweep, the spray would run as if it had been selected.
+    # Password spraying needs its own explicit key so it can be targeted with --only
+    # or suppressed with --skip independently of the rest of the phase.
+    if skip_if_exists "${SPRAY_OUT}" "Password spray results" "password_spray"; then
         :
     else
+        # Spray needs DOMAIN_USER/PASS to authenticate AND a user list from LDAP.
+        # Both are enforced inline so running --only password_spray tells the operator
+        # exactly what they still need to collect first.
+        require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
         require_file "${OUT_AD}/userlist.txt"
 
         MAX_ATTEMPTS="${SPRAY_MAX_ATTEMPTS:-2}"
@@ -439,16 +468,25 @@ else
                     --continue-on-success \
                     2>&1 >> "${SPRAY_OUT}" || true
 
-                HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || echo 0)
+                # `grep -c` exits 1 on no-match AFTER printing "0", so `|| echo 0`
+                # double-counts into "0\n0".  `|| true` + digit-strip gives a
+                # single-scalar safe for log display and downstream arithmetic.
+                HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || true)
+                HITS="${HITS//[^0-9]/}"
+                HITS="${HITS:-0}"
                 log OK "Spray attempt $((attempt+1)) complete. Hits so far: ${HITS}"
-                (( attempt++ ))
+                # (( attempt++ )) returns exit 1 when the pre-increment value was 0,
+                # which trips `set -e`.  Use the assignment form to avoid that footgun.
+                attempt=$(( attempt + 1 ))
 
                 if [[ ${attempt} -lt ${MAX_ATTEMPTS} && ${#SPRAY_PASSWORDS[@]} -gt ${attempt} ]]; then
                     log INFO "Waiting ${DELAY_SECS}s before next spray attempt (anti-lockout delay)..."
                     sleep "${DELAY_SECS}"
                 fi
             done
-            SPRAY_HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || echo 0)
+            SPRAY_HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || true)
+            SPRAY_HITS="${SPRAY_HITS//[^0-9]/}"
+            SPRAY_HITS="${SPRAY_HITS:-0}"
             [[ "${SPRAY_HITS}" -gt 0 ]] && \
                 log WARN "FINDING: ${SPRAY_HITS} account(s) found via password spray → ${SPRAY_OUT}" || \
                 log OK "Password spray: no hits with tested passwords"

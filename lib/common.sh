@@ -110,12 +110,17 @@ detect_cme() {
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 LOG_FILE="${OUTPUT_BASE_DIR:-$HOME/vapt}/engagement_log.md"
+# Ensure the log directory exists once at source time so the first `log` call
+# does not fail when a phase script is invoked before phase0 has created dirs.
+mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || true
 
 log() {
     local level="$1"; shift
     local msg="$*"
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "## [${ts}] [${level}] ${msg}" >> "${LOG_FILE}"
+    # `>>` to a missing directory would fail under `set -e`; this guard keeps
+    # logging non-fatal even if OUTPUT_BASE_DIR was mistyped.
+    echo "## [${ts}] [${level}] ${msg}" >> "${LOG_FILE}" 2>/dev/null || true
     case "$level" in
         INFO)    echo -e "${CYAN}[${ts}] [INFO]${RESET}  ${msg}" ;;
         OK)      echo -e "${GREEN}[${ts}] [OK]${RESET}    ${msg}" ;;
@@ -133,9 +138,11 @@ log() {
 log_cmd() {
     # Log a command before running it
     log CMD "$*"
-    echo "\`\`\`" >> "${LOG_FILE}"
-    echo "$*" >> "${LOG_FILE}"
-    echo "\`\`\`" >> "${LOG_FILE}"
+    {
+        echo "\`\`\`"
+        echo "$*"
+        echo "\`\`\`"
+    } >> "${LOG_FILE}" 2>/dev/null || true
 }
 
 # ─── HUMAN CHECKPOINT ─────────────────────────────────────────────────────────
@@ -186,10 +193,22 @@ check_testing_window() {
             log INFO "Outside testing window (${current_time}) — offline/passive job continues regardless"
             return 0
         fi
+        # AUTO_APPROVE covers non-interactive pipeline runs where reading stdin
+        # is impossible.  Orchestrator sets this when --auto-approve is passed.
+        if [[ "${AUTO_APPROVE:-false}" == "true" ]]; then
+            log WARN "Outside testing window (${current_time}) — auto-approved via AUTO_APPROVE=true"
+            return 0
+        fi
         echo -e "${RED}[SAFETY] Current time ${current_time} is outside testing window (${start}–${end}).${RESET}"
         echo -e "${YELLOW}Override? This may violate the Rules of Engagement. [y/N]:${RESET} \c"
-        read -r override
-        [[ "$override" != "y" && "$override" != "Y" ]] && { log WARN "Testing blocked outside hours at ${current_time}"; exit 1; }
+        # Guard read against a non-interactive stdin (e.g. piped invocation) so the
+        # phase script does not abort on EOF with a confusing exit-1 trace.
+        local override=""
+        read -r override || override=""
+        if [[ "$override" != "y" && "$override" != "Y" ]]; then
+            log WARN "Testing blocked outside hours at ${current_time}"
+            exit 1
+        fi
         log WARN "Testing window overridden by operator at ${current_time}"
     fi
 }
@@ -208,12 +227,21 @@ bg_run() {
     # closes.  disown removes it from bash's job table.  The PID is persisted to
     # BG_JOBS_FILE so orchestrator --status can track completion at any time.
     local name="$1"; local logfile="$2"; shift 2
+    # Make sure the log file's parent directory exists before the child writes to it.
+    mkdir -p "$(dirname "${logfile}")" 2>/dev/null || true
     log_cmd "$*"
     nohup "$@" >> "${logfile}" 2>&1 &
     local pid=$!
-    disown "$pid"
+    # `disown` fails (exit 1) if the child already exited before we got here —
+    # e.g. nmap aborted instantly on a bad flag.  Under `set -e` that failure
+    # would kill the whole phase script.  Suppress both the non-zero exit and
+    # the "no such job" stderr so a fast-failing child surfaces via its own
+    # logfile, not via a silent phase-script abort.
+    disown "$pid" 2>/dev/null || true
     BG_JOB_PIDS+=("$pid")
     BG_JOB_NAMES+=("$name")
+    # Ensure the persistent job record file and its parent directory exist.
+    mkdir -p "$(dirname "${BG_JOBS_FILE}")" 2>/dev/null || true
     echo "${pid}|${name}|${logfile}|$(date '+%Y-%m-%d %H:%M:%S')" >> "${BG_JOBS_FILE}"
     log INFO "Background job started: ${name} (PID: ${pid}) → ${logfile}"
     echo -e "${GREEN}  [BG] ${name} (PID: ${pid}) running — terminal-safe (nohup/disown)${RESET}"
@@ -223,6 +251,15 @@ bg_run() {
 wait_for_bg_jobs() {
     local label="${1:-all background jobs}"
     echo -e "\n${CYAN}Waiting for: ${label}${RESET}"
+    # Guard against empty array under `set -u` — older bash treats "${!arr[@]}"
+    # on an unset/empty array as an unbound-variable error.  When every sweep in
+    # the loop was skipped (e.g. all .gnmap files already exist), BG_JOB_PIDS is
+    # empty and this would otherwise abort the phase script.
+    if [[ ${#BG_JOB_PIDS[@]} -eq 0 ]]; then
+        log INFO "No background jobs to wait for (${label})"
+        notify_complete "$label"
+        return 0
+    fi
     for i in "${!BG_JOB_PIDS[@]}"; do
         local pid="${BG_JOB_PIDS[$i]}"
         local name="${BG_JOB_NAMES[$i]}"
@@ -242,9 +279,9 @@ wait_for_bg_jobs() {
 
 status_bg_jobs() {
     echo -e "\n${CYAN}Background Job Status (in-session):${RESET}"
-    if [[ ${#BG_JOB_PIDS[@]} -eq 0 ]]; then
+    if [[ ${#BG_JOB_PIDS[@]:-0} -eq 0 ]]; then
         echo -e "  No jobs tracked in this session."
-        return
+        return 0
     fi
     for i in "${!BG_JOB_PIDS[@]}"; do
         local pid="${BG_JOB_PIDS[$i]}"
@@ -370,28 +407,36 @@ phase_dir() {
 # SKIP_STEPS="kerberoast,scoutsuite"  → run everything except those two steps
 # ONLY_STEPS="bloodhound,roadrecon"   → run only those two steps, skip all others
 #
-# _step_is_skipped "key" returns 0 (skip) or 1 (proceed).
+# _step_is_skipped "key" [quiet]      → 0 = skip, 1 = proceed.
+#   If the second arg is the literal string "quiet", no log/stdout line is
+#   emitted.  Used by pre-flight checks (credential requirement scan) that
+#   iterate many step keys and would otherwise flood the log with "Skipping".
 _step_is_skipped() {
     local key="$1"
+    local quiet="${2:-}"
     # --only mode: skip anything NOT in the list
     if [[ -n "${ONLY_STEPS:-}" ]]; then
         local item
         for item in ${ONLY_STEPS//,/ }; do
             [[ "${item// /}" == "$key" ]] && return 1  # in list → proceed
         done
-        log INFO "Skipping (not in --only list): ${key}"
-        echo -e "${YELLOW}  [SKIP] ${key} — not in --only list${RESET}"
+        if [[ "${quiet}" != "quiet" ]]; then
+            log INFO "Skipping (not in --only list): ${key}"
+            echo -e "${YELLOW}  [SKIP] ${key} — not in --only list${RESET}"
+        fi
         return 0  # not in list → skip
     fi
     # --skip mode: skip anything IN the list
     if [[ -n "${SKIP_STEPS:-}" ]]; then
         local item
         for item in ${SKIP_STEPS//,/ }; do
-            [[ "${item// /}" == "$key" ]] && {
-                log INFO "Skipping (--skip): ${key}"
-                echo -e "${YELLOW}  [SKIP] ${key} — excluded via --skip${RESET}"
+            if [[ "${item// /}" == "$key" ]]; then
+                if [[ "${quiet}" != "quiet" ]]; then
+                    log INFO "Skipping (--skip): ${key}"
+                    echo -e "${YELLOW}  [SKIP] ${key} — excluded via --skip${RESET}"
+                fi
                 return 0  # in list → skip
-            }
+            fi
         done
     fi
     return 1  # proceed
@@ -417,6 +462,12 @@ skip_if_exists() {
 # ─── SAFE EXIT ON CTRL+C ──────────────────────────────────────────────────────
 cleanup_on_exit() {
     echo -e "\n${YELLOW}Interrupt received. Stopping background jobs...${RESET}"
+    # Empty-array guard under `set -u`: older bash errors on "${arr[@]}" when arr
+    # is empty/unset.  If no background jobs were launched, there's nothing to kill.
+    if [[ ${#BG_JOB_PIDS[@]:-0} -eq 0 ]]; then
+        log WARN "Session interrupted by operator (no background jobs to kill)"
+        exit 1
+    fi
     for pid in "${BG_JOB_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             # Kill the entire process group to catch sudo/child wrappers (e.g. Responder)

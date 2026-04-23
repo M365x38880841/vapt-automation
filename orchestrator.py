@@ -141,6 +141,7 @@ STEP_REGISTRY = {
         "bloodhound":      "BloodHound data collection",
         "roadrecon":       "ROADrecon Entra ID gather",
         "azure_inventory": "Azure resource inventory across subscriptions",
+        "password_spray":  "Controlled password spray (requires SPRAY_ENABLED=true)",
     },
     2: {
         "scoutsuite":      "ScoutSuite Azure audit (per subscription)",
@@ -182,6 +183,7 @@ STEP_CRED_REQUIREMENTS: dict[int, dict[str, list[str]]] = {
         "bloodhound":      ["DOMAIN_USER", "DOMAIN_PASS"],
         "roadrecon":       ["DOMAIN_USER", "DOMAIN_PASS"],
         "azure_inventory": [],
+        "password_spray":  ["DOMAIN_USER", "DOMAIN_PASS"],
     },
     2: {
         "scoutsuite":     [],
