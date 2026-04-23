@@ -344,8 +344,92 @@ if "${DC[@]}" -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy
     log OK "BloodHound CE stack already running → http://localhost:8080"
 else
     if checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"; then
+        # ── Stale Neo4j volume guard (fixes "too many colons in address") ─────
+        # Neo4j persists its cluster routing table inside the /data volume. If
+        # a previous run advertised the container hostname (or defaulted to it)
+        # Docker DNS may have resolved that to an IPv6-mapped IPv4 form like
+        # ::ffff:172.28.1.3 and cached it into the routing entries. Even after
+        # fixing the compose file to advertise the static IPv4, Neo4j will
+        # keep replaying the stale entry on startup, and BloodHound's Go bolt
+        # client will still fail with "too many colons in address".
+        #
+        # Detection: look for (a) an existing neo4j-data volume from a prior
+        # run, combined with (b) a previous bloodhound container that exited
+        # with the colon error in its logs. Either alone is not conclusive,
+        # so we offer the wipe via a checkpoint gate rather than doing it
+        # unconditionally — the user may have collection data worth keeping.
+        BHCE_VOLUME_PREFIX="$(basename "${BHCE_DIR}")"   # usually "bloodhound-ce"
+        NEO4J_VOL_NAME="${BHCE_VOLUME_PREFIX}_neo4j-data"
+        stale_volume=false
+        bolt_error_seen=false
+
+        if docker volume inspect "${NEO4J_VOL_NAME}" &>/dev/null; then
+            stale_volume=true
+            log INFO "Existing Neo4j data volume detected: ${NEO4J_VOL_NAME}"
+        fi
+
+        # Scan any prior bloodhound container logs (running or exited) for the
+        # signature Go net.Dial error. `docker compose logs` only works if the
+        # services have ever been created; suppress errors if not.
+        if "${DC[@]}" -f "${BHCE_COMPOSE}" logs --no-color --tail=200 bloodhound 2>/dev/null \
+            | grep -qiE 'too many colons in address|::ffff:'; then
+            bolt_error_seen=true
+            log WARN "Previous BloodHound container shows the 'too many colons' bolt error in logs."
+        fi
+
+        if $stale_volume && $bolt_error_seen; then
+            log WARN "Stale Neo4j routing table is the likely cause. Wiping the volume"
+            log WARN "is the only reliable fix — the graph will be empty and you must"
+            log WARN "re-run SharpHound/BloodHound-python collection after the wipe."
+            if checkpoint "Wipe neo4j-data volume to clear stale IPv6-mapped routing entries?"; then
+                log INFO "Stopping stack before volume removal..."
+                "${DC[@]}" -f "${BHCE_COMPOSE}" down 2>&1 | tail -3 || true
+                if docker volume rm "${NEO4J_VOL_NAME}" &>/dev/null; then
+                    log OK "Removed stale volume: ${NEO4J_VOL_NAME}"
+                else
+                    log WARN "Could not remove ${NEO4J_VOL_NAME} — try manually: docker volume rm ${NEO4J_VOL_NAME}"
+                fi
+            else
+                log WARN "Volume wipe skipped — bolt error may persist. Re-run with wipe if it does."
+            fi
+        elif $stale_volume; then
+            log INFO "Neo4j volume exists but no prior bolt error was detected — keeping collection data."
+        fi
+
         log INFO "Pulling and starting BloodHound CE stack (first run downloads ~1.5 GB, may take 3–5 min)..."
         "${DC[@]}" -f "${BHCE_COMPOSE}" up -d 2>&1 | tail -5
+
+        # ── Wait for Neo4j bolt port (tcp://localhost:7687) FIRST ─────────────
+        # BloodHound's graph_db client dials bolt://172.28.1.3:7687 well before
+        # it ever binds the HTTP :8080 listener. If the bolt port is not
+        # accepting connections — e.g. Neo4j crashed on the IPv6-mapped address
+        # error, the listen address is wrong, or the JVM is still initialising
+        # — BloodHound exits/crash-loops and /api/version will never respond.
+        # Polling HTTP first would waste the full 180s budget on a failure
+        # mode that a 3-line TCP check surfaces in seconds, and the log line
+        # below tells the operator exactly where to look.
+        #
+        # Implementation: bash's /dev/tcp pseudo-device opens a TCP connection
+        # without requiring nc/ncat on the host. `echo >` is a no-op write
+        # that succeeds iff the SYN-ACK completes.
+        log INFO "Waiting for Neo4j bolt port (tcp://localhost:7687, up to 120s)..."
+        bolt_wait=0
+        bolt_ready=false
+        while [[ $bolt_wait -lt 120 ]]; do
+            if (echo > /dev/tcp/localhost/7687) 2>/dev/null; then
+                bolt_ready=true
+                break
+            fi
+            sleep 3; (( bolt_wait += 3 ))
+            [[ $(( bolt_wait % 30 )) -eq 0 ]] && log INFO "  bolt not ready yet... (${bolt_wait}s elapsed)"
+        done
+        if $bolt_ready; then
+            log OK "Neo4j bolt port open after ${bolt_wait}s — proceeding to HTTP poll"
+        else
+            log WARN "Neo4j bolt port not reachable within 120s — BloodHound will almost certainly fail."
+            log WARN "  Inspect: ${DC[*]} -f ${BHCE_COMPOSE} logs graph-db | tail -40"
+            log WARN "  Look for 'too many colons in address' or listen-address bind failures."
+        fi
 
         # ── Wait for BloodHound HTTP endpoint — not just container status ─────────
         # Container status (healthy/running) reflects Postgres/Neo4j readiness, but
@@ -365,6 +449,47 @@ else
 
         if $bh_ready; then
             log OK "BloodHound CE is serving → http://localhost:8080 (${bh_wait}s)"
+
+            # ── Post-HTTP sanity: detect silent crash-looping containers ──────
+            # BloodHound can return 200 on /api/version even when its Neo4j
+            # connection is broken under the hood — the Go process serves the
+            # version endpoint before failing its bolt handshake and the whole
+            # container can enter a restart loop while HTTP still briefly
+            # responds between restarts. We confirm the stack is actually
+            # stable by inspecting `docker ps` restart counts across ALL
+            # compose services. A high restart count (>= 3) in the first
+            # 180s means the service is crash-looping, not running.
+            #
+            # We parse `docker inspect` directly rather than `compose ps` so we
+            # get an integer RestartCount that's stable across compose v1/v2.
+            log INFO "Verifying stack stability — checking container restart counts..."
+            unstable=false
+            # Resolve container IDs for all services in this compose project.
+            # `compose ps -q` prints one container ID per line.
+            mapfile -t bhce_cids < <("${DC[@]}" -f "${BHCE_COMPOSE}" ps -q 2>/dev/null)
+            for cid in "${bhce_cids[@]}"; do
+                [[ -z "$cid" ]] && continue
+                cname=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | sed 's|^/||')
+                rcount=$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || echo 0)
+                rcount="${rcount//[^0-9]/}"
+                rcount="${rcount:-0}"
+                if (( rcount >= 3 )); then
+                    log WARN "  Container ${cname} has restarted ${rcount} times — crash loop likely."
+                    unstable=true
+                elif (( rcount > 0 )); then
+                    log INFO "  Container ${cname}: restart count ${rcount} (tolerable)."
+                else
+                    log OK "  Container ${cname}: stable (0 restarts)."
+                fi
+            done
+            if $unstable; then
+                log WARN "One or more containers are crash-looping despite /api/version responding."
+                log WARN "The HTTP 200 was likely served in a brief window between restarts."
+                log WARN "Inspect the offending container(s):"
+                log WARN "  ${DC[*]} -f ${BHCE_COMPOSE} logs --tail=80 graph-db bloodhound"
+                log WARN "Most common cause after this fix: stale neo4j-data volume — re-run phase0"
+                log WARN "and accept the volume-wipe checkpoint."
+            fi
         else
             log WARN "BloodHound CE did not respond within 180s. Check container logs:"
             log WARN "  ${DC[*]} -f ${BHCE_COMPOSE} logs bloodhound | tail -30"

@@ -42,14 +42,30 @@ services:
     restart: unless-stopped
 
   graph-db:
+    # Neo4j 4.4 is SpecterOps' documented minimum for BloodHound CE. Neo4j 5.x
+    # is also supported and sidesteps most of the IPv6 routing-table quirks
+    # fixed below — if you hit persistent bolt issues, bump this to neo4j:5.
+    # Upgrade path: stop the stack, wipe the neo4j-data volume (see phase0),
+    # switch the tag, and restart. Credentials and config stay the same.
     image: docker.io/library/neo4j:4.4
     environment:
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
       NEO4J_dbms_allow__upgrade: "true"
       # Neo4j 4.4 JVM: force IPv4 stack so the bolt connector binds on
-      # 0.0.0.0:7687 (IPv4) rather than [::]:7687 (IPv6).
+      # IPv4 rather than [::]:7687 (IPv6). Required but NOT sufficient on its
+      # own — Docker's embedded DNS can still feed IPv6-mapped addresses into
+      # Neo4j's routing table regardless of the JVM flag.
       NEO4J_dbms_jvm_additional: "-Djava.net.preferIPv4Stack=true"
-      NEO4J_dbms_connector_bolt_listen__address: "0.0.0.0:7687"
+
+      # ── Listen address: explicit IPv4, NOT wildcard ─────────────────────
+      # Previously set to "0.0.0.0:7687". On some Docker hosts the JVM still
+      # grabs an IPv6 socket via ::/0 dual-stack binding even with
+      # preferIPv4Stack=true, which in turn causes Neo4j to report its routing
+      # entry as the IPv6-mapped form. Binding to the container's static IPv4
+      # eliminates any dual-stack ambiguity.
+      NEO4J_dbms_connector_bolt_listen__address: "172.28.1.3:7687"
+
+      # ── Bolt-connector-specific advertised address ──────────────────────
       # MUST be the explicit static IPv4 — not the hostname "graph-db".
       # Docker's internal DNS can return an IPv6-mapped address for container
       # hostnames even on enable_ipv6:false networks (e.g. ::ffff:172.28.1.3).
@@ -58,6 +74,23 @@ services:
       # Go's net.Dial rejects with "too many colons in address".
       # Using the static IPv4 ensures the advertised address is unambiguous.
       NEO4J_dbms_connector_bolt_advertised__address: "172.28.1.3:7687"
+
+      # ── Default advertised address (the real root-cause fix) ────────────
+      # Neo4j 4.4 has TWO advertised-address settings:
+      #   1. dbms.connector.bolt.advertised_address  (bolt-only — set above)
+      #   2. dbms.default_advertised_address         (BASE for all connectors
+      #                                               AND the routing table)
+      # Setting (1) alone is not enough: when Neo4j assembles the cluster
+      # routing table it falls back to dbms.default_advertised_address, which
+      # defaults to the container hostname. Docker DNS may resolve that to an
+      # IPv6-mapped IPv4 form (::ffff:172.28.1.3) and push that into the
+      # routing response. Go's bolt driver then builds an unbracketed
+      # "bolt://::ffff:172.28.1.3:7687" URL and fails with
+      # "too many colons in address".
+      # Env-var naming for Neo4j 4.4: dots → single underscore,
+      # underscores inside the key → double underscore, prepend NEO4J_.
+      # So dbms.default_advertised_address → NEO4J_dbms_default__advertised__address
+      NEO4J_dbms_default__advertised__address: "172.28.1.3"
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7474:7474"
@@ -67,11 +100,24 @@ services:
       bhce:
         ipv4_address: 172.28.1.3
     healthcheck:
-      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
+      # A TCP probe against the HTTP browser (7474) only proves the JVM is up
+      # and the web connector is bound — NOT that the bolt connector (7687) is
+      # accepting connections. BloodHound speaks bolt, not HTTP, so the gate
+      # on `depends_on: service_healthy` MUST verify bolt readiness or else
+      # BloodHound starts too early and fails its initial Neo4j handshake.
+      # /dev/tcp is a bash builtin that opens a socket without needing nc/ncat
+      # (neither are installed in the default neo4j image). We invoke bash
+      # explicitly because CMD-SHELL uses /bin/sh → dash on Debian, and dash
+      # does NOT implement the /dev/tcp pseudo-device.
+      test: ["CMD", "bash", "-c", "wget -q -O /dev/null http://localhost:7474 && (echo > /dev/tcp/localhost/7687) 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 90s
+      retries: 12
+      # Neo4j 4.4 first-boot initialization (creating the data directory, applying
+      # allow__upgrade, binding connectors) can exceed the prior 90s budget on
+      # slower hosts and cold image pulls — bumping to 120s prevents spurious
+      # "unhealthy" flips that stall BloodHound's `depends_on: service_healthy`.
+      start_period: 120s
     restart: unless-stopped
 
   bloodhound:
