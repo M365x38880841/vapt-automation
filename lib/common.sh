@@ -263,15 +263,28 @@ wait_for_bg_jobs() {
     for i in "${!BG_JOB_PIDS[@]}"; do
         local pid="${BG_JOB_PIDS[$i]}"
         local name="${BG_JOB_NAMES[$i]}"
-        if kill -0 "$pid" 2>/dev/null; then
+        # Use /proc/$pid (Linux procfs) instead of `kill -0`.
+        # `kill -0` to a root-owned process (e.g. nmap -sS) from a non-root caller
+        # returns exit 1 (EPERM) — indistinguishable from "process not found" —
+        # so the loop exits immediately and LIVE_COUNT is checked before nmap writes
+        # its .gnmap output.  /proc/$pid exists for any live process regardless of
+        # ownership.  Fall back to kill -0 on non-Linux (macOS, BSD).
+        _proc_alive() {
+            local p="$1"
+            if [[ -d /proc ]]; then
+                [[ -d "/proc/${p}" ]]
+            else
+                kill -0 "$p" 2>/dev/null
+            fi
+        }
+        if _proc_alive "$pid"; then
             echo -e "  ${YELLOW}⏳ Waiting for: ${name} (PID: ${pid})${RESET}"
-            # Poll with kill -0 instead of `wait` — disowned jobs are removed from
-            # bash's job table so `wait $pid` returns immediately without blocking.
-            while kill -0 "$pid" 2>/dev/null; do sleep 2; done
+            while _proc_alive "$pid"; do sleep 2; done
             log OK "${name} completed"
         else
             log OK "${name} already finished (PID: ${pid})"
         fi
+        unset -f _proc_alive
     done
     BG_JOB_PIDS=(); BG_JOB_NAMES=()
     notify_complete "$label"

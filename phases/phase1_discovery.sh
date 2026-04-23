@@ -11,6 +11,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/common.sh"
 
+# ERR trap: print the exact line and command that caused set -e to fire.
+# Remove this trap once the exit-code-1 issue is resolved.
+trap 'rc=$?
+echo -e "\033[0;31m[FATAL] phase1 aborted — line ${LINENO}, exit ${rc}\033[0m" >&2
+echo -e "\033[0;31m        Command: ${BASH_COMMAND}\033[0m" >&2
+exit ${rc}' ERR
+
 log PHASE "Phase 1 — Reconnaissance & Discovery"
 check_testing_window
 detect_system_resources
@@ -69,7 +76,7 @@ _gnmap_live_ips() {
 #   respond on real Windows workstations and servers, eliminating infrastructure
 #   noise at the sweep stage rather than having to filter it later.
 log INFO "Starting TCP host sweep across all subnets (parallel, no ICMP)..."
-log INFO "Discovery ports: ${NMAP_DISCOVERY_PORTS:-22,80,135,139,443,445,3389,5985,8080,8443}"
+log INFO "Discovery ports: ${NMAP_DISCOVERY_PORTS:-88,135,139,443,3389,5985,8080,8443}"
 LIVE_HOSTS_MERGED="${OUT_NET}/live_hosts_all.txt"
 > "${LIVE_HOSTS_MERGED}"
 
@@ -99,7 +106,7 @@ for subnet in ${TARGET_SUBNETS}; do
         "${OUT_NET}/hostsweep_${safe_name}.log" \
         "${NMAP_BIN:-nmap}" \
             -sS --open \
-            -p "${NMAP_DISCOVERY_PORTS:-22,80,135,139,443,445,3389,5985,8080,8443}" \
+            -p "${NMAP_DISCOVERY_PORTS:-88,135,139,443,3389,5985,8080,8443}" \
             -T"${NMAP_TIMING:-3}" \
             --max-rate "${NMAP_MAX_RATE:-500}" \
             --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
@@ -152,13 +159,17 @@ fi
 FULLSCAN_OUT="${OUT_NET}/fullscan"
 CHUNK_DIR="${OUT_NET}/scan_chunks"
 
-# Attempt merge from existing chunks first (idempotent resume after partial run)
-if [[ -d "${CHUNK_DIR}" ]] && ls "${CHUNK_DIR}"/fullscan_chunk_*.gnmap &>/dev/null; then
-    TOTAL_CHUNKS=$(ls -1 "${CHUNK_DIR}"/chunk_* 2>/dev/null | wc -l)
-    DONE_CHUNKS=$(ls -1 "${CHUNK_DIR}"/fullscan_chunk_*.xml 2>/dev/null | wc -l)
+# Attempt merge from existing chunks first (idempotent resume after partial run).
+# Use find instead of `ls ... | wc -l` — `ls glob | wc` trips set -eo pipefail
+# when the glob matches nothing (ls exits 1, wc exits 0, pipefail picks up the 1).
+if [[ -d "${CHUNK_DIR}" ]]; then
+    TOTAL_CHUNKS=$(find "${CHUNK_DIR}" -maxdepth 1 -name 'chunk_*'           2>/dev/null | wc -l || echo 0)
+    DONE_CHUNKS=$(find  "${CHUNK_DIR}" -maxdepth 1 -name 'fullscan_chunk_*.xml' 2>/dev/null | wc -l || echo 0)
+    TOTAL_CHUNKS="${TOTAL_CHUNKS//[^0-9]/}"; TOTAL_CHUNKS="${TOTAL_CHUNKS:-0}"
+    DONE_CHUNKS="${DONE_CHUNKS//[^0-9]/}";   DONE_CHUNKS="${DONE_CHUNKS:-0}"
     if [[ "${DONE_CHUNKS}" -ge "${TOTAL_CHUNKS}" && "${TOTAL_CHUNKS}" -gt 0 ]]; then
-        cat "${CHUNK_DIR}"/fullscan_chunk_*.gnmap | sort -u > "${FULLSCAN_OUT}.gnmap" 2>/dev/null || true
-        cat "${CHUNK_DIR}"/fullscan_chunk_*.nmap          > "${FULLSCAN_OUT}.nmap"  2>/dev/null || true
+        cat "${CHUNK_DIR}"/fullscan_chunk_*.gnmap 2>/dev/null | sort -u > "${FULLSCAN_OUT}.gnmap" || true
+        cat "${CHUNK_DIR}"/fullscan_chunk_*.nmap  2>/dev/null           > "${FULLSCAN_OUT}.nmap"  || true
         log OK "Merged ${DONE_CHUNKS}/${TOTAL_CHUNKS} existing scan chunks into ${FULLSCAN_OUT}.gnmap"
     fi
 fi
@@ -167,7 +178,7 @@ if ! skip_if_exists "${FULLSCAN_OUT}.gnmap" "Full port scan" "nmap_fullscan"; th
     if [[ "${LIVE_COUNT}" -eq 0 ]]; then
         log WARN "Full port scan requires a non-empty live hosts list. Skipping nmap_fullscan."
         log INFO "Resolve TARGET_SUBNETS / NMAP_DISCOVERY_PORTS, then re-run: python3 orchestrator.py --phase 1 --only host_sweep,nmap_fullscan"
-    elif checkpoint "Start full TCP port scan (-p-) against ${LIVE_COUNT} validated hosts? (${SYS_VCPUS} parallel jobs on ${SYS_VCPUS}-vCPU system)"; then
+    elif checkpoint "Start full port scan (ports: ${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}) against ${LIVE_COUNT} validated hosts? (${SYS_VCPUS} parallel jobs on ${SYS_VCPUS}-vCPU system)"; then
 
         mkdir -p "${CHUNK_DIR}"
         SCAN_RATE=$(( ${NMAP_MAX_RATE:-500} * 2 ))  # aggressive on confirmed live hosts
@@ -185,7 +196,8 @@ if ! skip_if_exists "${FULLSCAN_OUT}.gnmap" "Full port scan" "nmap_fullscan"; th
                 bg_run "nmap_fullscan_${suffix}" \
                     "${CHUNK_DIR}/fullscan_${suffix}.log" \
                     "${NMAP_BIN:-nmap}" \
-                        -sS -sV -sC -p- --open \
+                        -sS -sV -sC --open \
+                        -p "${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}" \
                         -T"${NMAP_TIMING:-3}" \
                         --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
                         --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
@@ -224,11 +236,12 @@ MERGE_EOF
             log INFO "Merge watcher active — results auto-consolidate to ${FULLSCAN_OUT}.gnmap when all chunks finish."
         else
             # ── Single job for small host lists ────────────────────────────
-            log INFO "Starting single full-port scan (${LIVE_COUNT} hosts)..."
+            log INFO "Starting full-port scan (${LIVE_COUNT} hosts, ports: ${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443})..."
             bg_run "nmap_fullscan" \
                 "${OUT_NET}/fullscan.log" \
                 "${NMAP_BIN:-nmap}" \
-                    -sS -sV -sC -p- --open \
+                    -sS -sV -sC --open \
+                    -p "${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}" \
                     -T"${NMAP_TIMING:-3}" \
                     --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
                     --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
@@ -308,7 +321,14 @@ fi
 # ─── STEP 1.7 — BLOODHOUND DATA COLLECTION (background) ──────────────────────
 BH_OUT_DIR="${OUT_AD}/bloodhound"
 mkdir -p "${BH_OUT_DIR}"
-BH_ZIP=$(ls "${BH_OUT_DIR}"/*.zip 2>/dev/null | head -1)
+# `ls *.zip | head -1` fails under set -eo pipefail when no zip files exist
+# (ls exits 1 → pipefail promotes the pipeline exit → set -e kills the script).
+# Use a safe glob expansion instead: the for-loop body never runs on no-match.
+BH_ZIP=""
+for _bh_f in "${BH_OUT_DIR}"/*.zip; do
+    if [[ -f "${_bh_f}" ]]; then BH_ZIP="${_bh_f}"; break; fi
+done
+unset _bh_f
 if _step_is_skipped "bloodhound"; then
     : # skip
 elif [[ -n "${BH_ZIP}" ]]; then
