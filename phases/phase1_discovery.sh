@@ -33,7 +33,7 @@ require_var "ATTACKER_INTERFACE"
 # ldap_banner itself does not need creds (nmap script is anonymous) but is
 # kept in the list for backwards-compat with earlier cred-gating logic.
 _needs_domain_creds=false
-for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon; do
+for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon password_spray; do
     if ! _step_is_skipped "${_cred_step}" quiet; then
         _needs_domain_creds=true; break
     fi
@@ -54,7 +54,10 @@ OUT_CLOUD="$(phase_dir phase1 cloud)"
 # Empty string → no exclusion flag (nmap errors on --exclude with empty value).
 NMAP_EXCL_ARG=""
 if [[ -n "${SCAN_EXCLUDE_RANGES:-}" ]]; then
-    NMAP_EXCL_ARG="--exclude $(echo "${SCAN_EXCLUDE_RANGES}" | tr ' ' ',')"
+    _excl="${SCAN_EXCLUDE_RANGES// /,}"
+    _excl="${_excl%%,}"  # strip any trailing comma
+    NMAP_EXCL_ARG="--exclude ${_excl}"
+    unset _excl
     log INFO "Exclusion list: ${SCAN_EXCLUDE_RANGES}"
 fi
 
@@ -68,6 +71,20 @@ _gnmap_live_ips() {
         | awk '{print $2}' | sort -u
 }
 
+# ─── HELPER: extract ALL attempted IPs from a gnmap (fullscan context) ───────
+# The fullscan (Phase B — service/version) runs WITHOUT --open, so the gnmap
+# contains hosts where every targeted port is filtered/closed.  Those hosts
+# still appear with a "Host: <ip> ... Status: Up" line (no Ports: line) or
+# with a Ports: line showing only filtered/closed states.  _gnmap_live_ips()
+# only keeps hosts with at least one open port, which would silently drop
+# firewalled-but-reachable Windows boxes from downstream phase inputs.
+# Use _gnmap_all_ips() whenever you need the complete set of hosts nmap
+# actually reached during the full scan.
+_gnmap_all_ips() {
+    local gnmap="$1"
+    grep -E '^Host:' "${gnmap}" 2>/dev/null | awk '{print $2}' | sort -u
+}
+
 # ─── STEP 1.1 — HOST SWEEP (TCP SYN — no ICMP, no ARP false positives) ───────
 # WHY TCP instead of -sn (ping sweep):
 #   -sn uses ICMP echo + ICMP timestamp + TCP SYN/ACK to ports 80 and 443.
@@ -79,6 +96,11 @@ log INFO "Starting TCP host sweep across all subnets (parallel, no ICMP)..."
 log INFO "Discovery ports: ${NMAP_DISCOVERY_PORTS:-88,135,139,443,3389,5985,8080,8443}"
 LIVE_HOSTS_MERGED="${OUT_NET}/live_hosts_all.txt"
 > "${LIVE_HOSTS_MERGED}"
+
+# Initialise LIVE_COUNT so the post-gate digit-strip (and any arithmetic
+# compare that follows) never sees an unbound variable under `set -u`, even
+# in the unlikely case that both branches of the skip gate fail to assign it.
+LIVE_COUNT=0
 
 if _step_is_skipped "host_sweep"; then
     for subnet in ${TARGET_SUBNETS}; do
@@ -102,6 +124,11 @@ for subnet in ${TARGET_SUBNETS}; do
         continue
     fi
     log INFO "TCP sweep: ${subnet}"
+    # RTT bounds trim infrastructure false positives: Windows hosts with open
+    # SMB/RDP/WinRM respond in <100ms on a LAN.  Slow-responding devices
+    # (managed switches, printers, UPS, IPMI) get dropped by the 300ms cap,
+    # so we finish the sweep with a cleaner live-host list and less noise in
+    # the downstream full-port scan.
     bg_run "hostsweep_${safe_name}" \
         "${OUT_NET}/hostsweep_${safe_name}.log" \
         "${NMAP_BIN:-nmap}" \
@@ -112,6 +139,8 @@ for subnet in ${TARGET_SUBNETS}; do
             --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
             --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
             --max-retries 1 \
+            --initial-rtt-timeout 100ms \
+            --max-rtt-timeout 300ms \
             --host-timeout 10s \
             ${NMAP_EXCL_ARG} \
             -oA "${sweep_out}" \
@@ -151,137 +180,261 @@ if [[ "${LIVE_COUNT}" -eq 0 ]]; then
     fi
 fi
 
-# ─── STEP 1.2 — FULL PORT SCAN (parallel across all vCPUs) ───────────────────
-# Splits the live hosts list into SYS_VCPUS chunks and runs one nmap per chunk
-# in parallel. On a 4-vCPU box this gives a ~4× wall-clock speedup over a
-# single sequential scan. Results are merged into fullscan.gnmap / fullscan.nmap
-# by a watcher job that fires automatically when all chunks finish.
+# ─── STEP 1.2 — FULL PORT SCAN (two-phase: port confirm → service/version) ───
+# Redesigned to fix the "empty fullscan.gnmap" failure mode.  Root causes of
+# the previous design:
+#   1. --host-timeout 30s was too short for -sV (multi-probe service detection)
+#      and -sC (NSE scripts that can take 10–60s per host per port).  Most
+#      hosts were aborted mid-scan and produced no output.
+#   2. --open on the targeted-port scan silently dropped hosts whose ports
+#      were all filtered (workstations that DROP rather than REJECT), so the
+#      full scan lost hosts even though they were live.
+#   3. -sC scripts in bulk were noisy, slow, and inconsistent — they belong
+#      in targeted follow-up scans, not the phase-1 sweep.
+#   4. The async merge-watcher pattern meant the gnmap file might not exist
+#      when downstream phases ran.  Replaced with foreground wait.
+#
+# New flow:
+#   Phase A — port confirmation (-sS --open, fast) → fullscan_portsonly.gnmap
+#   Phase B — service/version on same hosts (-sS -sV, no -sC, no --open) → fullscan.gnmap
+#   A foreground `wait_for_bg_jobs` between/after each phase ensures outputs
+#   exist before phase 2 consumes them.  Parallel chunking is preserved ONLY
+#   for LIVE_COUNT > 200; below that, a single scan is faster end-to-end
+#   because chunking overhead + per-chunk scan ramp-up exceeds serial gain.
 FULLSCAN_OUT="${OUT_NET}/fullscan"
+FULLSCAN_PORTS_OUT="${OUT_NET}/fullscan_portsonly"
+OPEN_PORTS_CONFIRMED="${OUT_NET}/open_ports_confirmed.txt"
 CHUNK_DIR="${OUT_NET}/scan_chunks"
 
-# Attempt merge from existing chunks first (idempotent resume after partial run).
-# Use find instead of `ls ... | wc -l` — `ls glob | wc` trips set -eo pipefail
-# when the glob matches nothing (ls exits 1, wc exits 0, pipefail picks up the 1).
-if [[ -d "${CHUNK_DIR}" ]]; then
-    TOTAL_CHUNKS=$(find "${CHUNK_DIR}" -maxdepth 1 -name 'chunk_*'           2>/dev/null | wc -l || echo 0)
-    DONE_CHUNKS=$(find  "${CHUNK_DIR}" -maxdepth 1 -name 'fullscan_chunk_*.xml' 2>/dev/null | wc -l || echo 0)
-    TOTAL_CHUNKS="${TOTAL_CHUNKS//[^0-9]/}"; TOTAL_CHUNKS="${TOTAL_CHUNKS:-0}"
-    DONE_CHUNKS="${DONE_CHUNKS//[^0-9]/}";   DONE_CHUNKS="${DONE_CHUNKS:-0}"
-    if [[ "${DONE_CHUNKS}" -ge "${TOTAL_CHUNKS}" && "${TOTAL_CHUNKS}" -gt 0 ]]; then
-        cat "${CHUNK_DIR}"/fullscan_chunk_*.gnmap 2>/dev/null | sort -u > "${FULLSCAN_OUT}.gnmap" || true
-        cat "${CHUNK_DIR}"/fullscan_chunk_*.nmap  2>/dev/null           > "${FULLSCAN_OUT}.nmap"  || true
-        log OK "Merged ${DONE_CHUNKS}/${TOTAL_CHUNKS} existing scan chunks into ${FULLSCAN_OUT}.gnmap"
-    fi
+# Empty-file-aware skip gate: the original `skip_if_exists` returns true even
+# if a zero-byte .gnmap was left behind by a prior failed run, which is how
+# the fullscan step was silently no-op'ing.  Only treat the output as valid
+# when it exists AND has non-zero content.
+_fullscan_is_valid() {
+    [[ -s "${FULLSCAN_OUT}.gnmap" ]]
+}
+
+# Clean up any empty-output artefact from a prior failed run so skip_if_exists
+# in common.sh won't short-circuit the rebuild.
+if [[ -f "${FULLSCAN_OUT}.gnmap" ]] && ! _fullscan_is_valid; then
+    log WARN "Removing empty fullscan.gnmap from prior run (zero-byte file)."
+    rm -f "${FULLSCAN_OUT}".{gnmap,nmap,xml} 2>/dev/null || true
 fi
 
-if ! skip_if_exists "${FULLSCAN_OUT}.gnmap" "Full port scan" "nmap_fullscan"; then
-    if [[ "${LIVE_COUNT}" -eq 0 ]]; then
-        log WARN "Full port scan requires a non-empty live hosts list. Skipping nmap_fullscan."
-        log INFO "Resolve TARGET_SUBNETS / NMAP_DISCOVERY_PORTS, then re-run: python3 orchestrator.py --phase 1 --only host_sweep,nmap_fullscan"
-    elif checkpoint "Start full port scan (ports: ${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}) against ${LIVE_COUNT} validated hosts? (${SYS_VCPUS} parallel jobs on ${SYS_VCPUS}-vCPU system)"; then
+if _step_is_skipped "nmap_fullscan"; then
+    :  # step explicitly skipped
+elif _fullscan_is_valid; then
+    log INFO "Skipping (already exists): Full port scan → ${FULLSCAN_OUT}.gnmap"
+    echo -e "${GREEN}  [SKIP] Full port scan — non-empty output already exists.${RESET}"
+elif [[ "${LIVE_COUNT}" -eq 0 ]]; then
+    log WARN "Full port scan requires a non-empty live hosts list. Skipping nmap_fullscan."
+    log INFO "Resolve TARGET_SUBNETS / NMAP_DISCOVERY_PORTS, then re-run: python3 orchestrator.py --phase 1 --only host_sweep,nmap_fullscan"
+elif checkpoint "Start full port scan (ports: ${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}) against ${LIVE_COUNT} validated hosts? (two-phase: port-confirm then service-detect)"; then
 
-        mkdir -p "${CHUNK_DIR}"
-        SCAN_RATE=$(( ${NMAP_MAX_RATE:-500} * 2 ))  # aggressive on confirmed live hosts
+    mkdir -p "${CHUNK_DIR}"
+    SCAN_RATE=$(( ${NMAP_MAX_RATE:-500} * 2 ))  # aggressive on confirmed live hosts
+    FS_HOST_TIMEOUT="${NMAP_HOST_TIMEOUT_FULLSCAN:-300}"
+    FS_VER_INTENSITY="${NMAP_VERSION_INTENSITY:-5}"
 
-        if [[ "${LIVE_COUNT}" -gt 50 && "${SYS_VCPUS:-1}" -gt 1 ]]; then
-            # ── Parallel path: one nmap per vCPU ────────────────────────────
+    # ── PHASE A — port confirmation (fast, --open, no version detection) ────
+    # Quickly re-confirms which ports are actually reachable on the live
+    # host list so Phase B can focus its service-detection budget on hosts
+    # with at least one open port.  60s host-timeout is safe here because
+    # -sS without -sV/-sC completes in single-digit seconds per host.
+    log INFO "Phase A: port confirmation scan (${LIVE_COUNT} hosts, --open, -sS only)..."
+    bg_run "nmap_fullscan_portsonly" \
+        "${OUT_NET}/fullscan_portsonly.log" \
+        "${NMAP_BIN:-nmap}" \
+            -sS --open \
+            -p "${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}" \
+            -T"${NMAP_TIMING:-4}" \
+            --max-rate 1000 \
+            --max-retries 2 \
+            --host-timeout 60s \
+            ${NMAP_EXCL_ARG} \
+            -iL "${LIVE_HOSTS_MERGED}" \
+            -oA "${FULLSCAN_PORTS_OUT}"
+    wait_for_bg_jobs "Phase A — port confirmation"
+
+    # OPEN_PORTS_CONFIRMED is for operator visibility only — Phase B uses LIVE_HOSTS_MERGED
+    # (not this file) so filtered-port hosts are not silently dropped from service detection.
+    if [[ -s "${FULLSCAN_PORTS_OUT}.gnmap" ]]; then
+        _gnmap_live_ips "${FULLSCAN_PORTS_OUT}.gnmap" > "${OPEN_PORTS_CONFIRMED}" || true
+    else
+        : > "${OPEN_PORTS_CONFIRMED}"
+    fi
+    CONFIRMED_COUNT=$(wc -l < "${OPEN_PORTS_CONFIRMED}" 2>/dev/null || echo 0)
+    CONFIRMED_COUNT="${CONFIRMED_COUNT//[^0-9]/}"
+    CONFIRMED_COUNT="${CONFIRMED_COUNT:-0}"
+    log OK "Phase A complete — ${CONFIRMED_COUNT} host(s) with confirmed-open ports → ${OPEN_PORTS_CONFIRMED}"
+
+    if [[ "${CONFIRMED_COUNT}" -eq 0 ]]; then
+        log WARN "No open ports confirmed on any live host. Skipping Phase B service detection."
+        # Seed fullscan.gnmap with the portsonly output so downstream skip-gates
+        # see a non-empty file and the operator can inspect filtered states.
+        cp "${FULLSCAN_PORTS_OUT}.gnmap" "${FULLSCAN_OUT}.gnmap" 2>/dev/null || true
+        cp "${FULLSCAN_PORTS_OUT}.nmap"  "${FULLSCAN_OUT}.nmap"  2>/dev/null || true
+    else
+        # ── PHASE B — service/version detection (no --open, no -sC) ─────────
+        # Run against the ORIGINAL live-hosts list (not just confirmed-open)
+        # so the gnmap captures filtered/closed states too — operator needs
+        # to see what was filtered vs closed vs open on every live host.
+        # --host-timeout 300s gives -sV enough probe budget; --version-intensity 5
+        # is the sweet spot between signal quality and scan duration.
+        if [[ "${LIVE_COUNT}" -gt 200 && "${SYS_VCPUS:-1}" -gt 1 ]]; then
+            # ── Parallel chunked path (only for large engagements) ─────────
             N_JOBS="${SYS_VCPUS}"
             LINES_PER_CHUNK=$(( LIVE_COUNT / N_JOBS + 1 ))
+            # Wipe any stale chunk splits from a prior run so split(1) doesn't
+            # interleave with old files and confuse the merge.
+            rm -f "${CHUNK_DIR}"/chunk_* "${CHUNK_DIR}"/fullscan_chunk_*.{gnmap,nmap,xml} 2>/dev/null || true
             split -l "${LINES_PER_CHUNK}" "${LIVE_HOSTS_MERGED}" "${CHUNK_DIR}/chunk_"
             CHUNK_LIST=( "${CHUNK_DIR}"/chunk_* )
-            log INFO "Splitting ${LIVE_COUNT} hosts into ${#CHUNK_LIST[@]} chunks (${LINES_PER_CHUNK} hosts/chunk)..."
+            log INFO "Phase B: splitting ${LIVE_COUNT} hosts into ${#CHUNK_LIST[@]} chunks (${LINES_PER_CHUNK} hosts/chunk)..."
 
             for chunk in "${CHUNK_LIST[@]}"; do
                 suffix=$(basename "${chunk}")
                 bg_run "nmap_fullscan_${suffix}" \
                     "${CHUNK_DIR}/fullscan_${suffix}.log" \
                     "${NMAP_BIN:-nmap}" \
-                        -sS -sV -sC --open \
+                        -sS -sV \
+                        --version-intensity "${FS_VER_INTENSITY}" \
                         -p "${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}" \
                         -T"${NMAP_TIMING:-3}" \
                         --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
                         --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
                         --max-rate "${SCAN_RATE}" \
                         --max-retries 2 \
-                        --host-timeout 30s \
+                        --host-timeout "${FS_HOST_TIMEOUT}s" \
                         ${NMAP_EXCL_ARG} \
                         -iL "${chunk}" \
                         -oA "${CHUNK_DIR}/fullscan_${suffix}"
             done
 
-            log INFO "${#CHUNK_LIST[@]} parallel nmap jobs started."
+            log INFO "Phase B: ${#CHUNK_LIST[@]} parallel nmap jobs started. Blocking until all complete..."
+            # FOREGROUND wait — the script must block here so that the merged
+            # gnmap is guaranteed to exist before phase 2 begins.  The async
+            # merge-watcher approach silently failed when the orchestrator
+            # moved on to phase 2 before the watcher finished.
+            wait_for_bg_jobs "Phase B — service/version scan"
 
-            # ── Launch a merge-watcher that polls until all chunks complete ──
-            MERGE_SCRIPT=$(mktemp /tmp/nmap_merge_XXXXXX.sh)
-            chmod +x "${MERGE_SCRIPT}"
-            cat > "${MERGE_SCRIPT}" <<MERGE_EOF
-#!/usr/bin/env bash
-CHUNK_DIR="${CHUNK_DIR}"
-FULLSCAN_OUT="${FULLSCAN_OUT}"
-N_CHUNKS=${#CHUNK_LIST[@]}
-echo "\$(date '+%H:%M:%S') Merge watcher started — waiting for \${N_CHUNKS} chunk(s)"
-while true; do
-    done_count=\$(ls -1 "\${CHUNK_DIR}"/fullscan_chunk_*.xml 2>/dev/null | wc -l)
-    echo "\$(date '+%H:%M:%S') \${done_count}/\${N_CHUNKS} chunks complete"
-    [[ \${done_count} -ge \${N_CHUNKS} ]] && break
-    sleep 30
-done
-echo "All chunks done — merging..."
-cat "\${CHUNK_DIR}"/fullscan_chunk_*.gnmap 2>/dev/null | sort -u > "\${FULLSCAN_OUT}.gnmap"
-cat "\${CHUNK_DIR}"/fullscan_chunk_*.nmap  2>/dev/null > "\${FULLSCAN_OUT}.nmap"
-echo "MERGE COMPLETE: \$(wc -l < "\${FULLSCAN_OUT}.gnmap") lines → \${FULLSCAN_OUT}.gnmap"
-rm -f "\$0"
-MERGE_EOF
-            bg_run "nmap_fullscan_merge" "${OUT_NET}/nmap_merge.log" bash "${MERGE_SCRIPT}"
-            log INFO "Merge watcher active — results auto-consolidate to ${FULLSCAN_OUT}.gnmap when all chunks finish."
+            # Synchronous merge now that every chunk is done.
+            # Guard with a file-existence check so the merge doesn't collapse to
+            # the literal glob pattern (with nullglob off) or error out (with
+            # nullglob/failglob on) when a chunk batch produced zero files.
+            _chunk_gnmaps=( "${CHUNK_DIR}"/fullscan_chunk_*.gnmap )
+            if [[ -f "${_chunk_gnmaps[0]}" ]]; then
+                cat "${_chunk_gnmaps[@]}" 2>/dev/null | sort -u > "${FULLSCAN_OUT}.gnmap" || true
+                cat "${CHUNK_DIR}"/fullscan_chunk_*.nmap 2>/dev/null > "${FULLSCAN_OUT}.nmap" || true
+            fi
+            unset _chunk_gnmaps
+            MERGED_LINES=$(wc -l < "${FULLSCAN_OUT}.gnmap" 2>/dev/null || echo 0)
+            MERGED_LINES="${MERGED_LINES//[^0-9]/}"; MERGED_LINES="${MERGED_LINES:-0}"
+            log OK "Phase B merge complete — ${MERGED_LINES} gnmap lines → ${FULLSCAN_OUT}.gnmap"
         else
-            # ── Single job for small host lists ────────────────────────────
-            log INFO "Starting full-port scan (${LIVE_COUNT} hosts, ports: ${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443})..."
+            # ── Single job path (LIVE_COUNT <= 200) ─────────────────────────
+            log INFO "Phase B: service/version scan (${LIVE_COUNT} hosts, -sV intensity=${FS_VER_INTENSITY}, host-timeout=${FS_HOST_TIMEOUT}s)..."
             bg_run "nmap_fullscan" \
                 "${OUT_NET}/fullscan.log" \
                 "${NMAP_BIN:-nmap}" \
-                    -sS -sV -sC --open \
+                    -sS -sV \
+                    --version-intensity "${FS_VER_INTENSITY}" \
                     -p "${NMAP_FULLSCAN_PORTS:-88,135,139,443,3389,5985,8080,8443}" \
                     -T"${NMAP_TIMING:-3}" \
                     --min-parallelism "${NMAP_MIN_PARALLEL:-40}" \
                     --max-parallelism "${NMAP_MAX_PARALLEL:-200}" \
                     --max-rate "${SCAN_RATE}" \
                     --max-retries 2 \
-                    --host-timeout 30s \
+                    --host-timeout "${FS_HOST_TIMEOUT}s" \
                     ${NMAP_EXCL_ARG} \
                     -iL "${LIVE_HOSTS_MERGED}" \
                     -oA "${FULLSCAN_OUT}"
+            # FOREGROUND wait — block until the scan finishes so the gnmap
+            # is guaranteed to exist when this phase returns to the orchestrator.
+            wait_for_bg_jobs "Phase B — service/version scan"
         fi
-    else
-        log INFO "Full port scan skipped — re-run: python3 orchestrator.py --phase 1 --only nmap_fullscan"
+
+        # Final sanity check — if Phase B produced nothing, fall back to
+        # the Phase A output so the downstream skip gate doesn't re-trigger
+        # an infinite-retry loop.
+        if ! _fullscan_is_valid; then
+            log WARN "Phase B produced empty gnmap — falling back to Phase A port-only output."
+            cp "${FULLSCAN_PORTS_OUT}.gnmap" "${FULLSCAN_OUT}.gnmap" 2>/dev/null || true
+            cp "${FULLSCAN_PORTS_OUT}.nmap"  "${FULLSCAN_OUT}.nmap"  2>/dev/null || true
+        fi
     fi
+else
+    log INFO "Full port scan skipped — re-run: python3 orchestrator.py --phase 1 --only nmap_fullscan"
 fi
 
-# ─── STEP 1.3 — SMB SWEEP + SIGNING CHECK (background) ──────────────────────
+# ─── STEP 1.3 — SMB SWEEP + SIGNING CHECK (background → foreground wait) ────
 SMB_OUT="${OUT_AD}/smb_sweep.txt"
+_smb_sweep_ran=false
 if ! skip_if_exists "${SMB_OUT}" "CrackMapExec SMB sweep" "smb_sweep"; then
     log INFO "Starting CrackMapExec SMB sweep (signing + host enumeration)..."
     # Use single-quoted bash -c body so DOMAIN_PASS (and other vars) are resolved
     # from the inherited environment at execution time, not expanded here.  Inline
     # double-quoted expansion would break if the password contains ' or \.
+    # `set -euo pipefail` inside the subshell promotes any failing subnet scan or
+    # unset required variable (CME_BIN/TARGET_SUBNETS/...) to a clean non-zero
+    # exit instead of silently producing an empty smb_sweep.txt.
     bg_run "cmexec_smb_sweep" \
         "${OUT_AD}/smb_sweep.log" \
-        bash -c 'for subnet in $TARGET_SUBNETS; do
-            $CME_BIN smb "$subnet" \
-                -u "$DOMAIN_USER" -p "$DOMAIN_PASS" -d "$DOMAIN_NAME" \
-                2>&1
-        done > "$OUTPUT_BASE_DIR/phase1/ad/smb_sweep.txt"'
+        bash -c 'set -euo pipefail
+for subnet in $TARGET_SUBNETS; do
+    $CME_BIN smb "$subnet" \
+        -u "$DOMAIN_USER" -p "$DOMAIN_PASS" -d "$DOMAIN_NAME" \
+        2>&1
+done > "$OUTPUT_BASE_DIR/phase1/ad/smb_sweep.txt"'
     log INFO "CME SMB sweep running in background."
+    _smb_sweep_ran=true
+
+    # Block until the SMB sweep completes before the signing-check below reads
+    # ${SMB_OUT}. Without this wait the signing-check is a race: the file may
+    # not exist or may be partially written when grep runs.
+    wait_for_bg_jobs "SMB sweep"
+    # common.sh's wait_for_bg_jobs already clears these, but set them
+    # defensively so subsequent wait_for_bg_jobs (e.g. for nmap) never re-waits
+    # on the CME PID by accident.
+    BG_JOB_PIDS=()
+    BG_JOB_NAMES=()
 fi
+
+# ─── SMB SIGNING CHECK — runs inline immediately after the wait above ───────
+# Moved up from its previous position so the grep always reads a complete file.
+if [[ -f "${SMB_OUT}" ]]; then
+    SIGNING_NOT_REQ=$(grep -c 'signing:False\|SMB signing: disabled\|signing: False' "${SMB_OUT}" 2>/dev/null || true)
+    SIGNING_NOT_REQ="${SIGNING_NOT_REQ//[^0-9]/}"
+    SIGNING_NOT_REQ="${SIGNING_NOT_REQ:-0}"
+    if [[ "${SIGNING_NOT_REQ}" -gt 0 ]]; then
+        log WARN "FINDING: ${SIGNING_NOT_REQ} host(s) with SMB Signing NOT REQUIRED — relay targets for Phase 3"
+        grep 'signing:False\|signing: False' "${SMB_OUT}" > "${OUT_AD}/relay_targets.txt" 2>/dev/null || true
+        # Extract just IPs for ntlmrelayx
+        awk '{print $2}' "${OUT_AD}/relay_targets.txt" 2>/dev/null | grep -E '^[0-9]+\.' \
+            > "${OUT_AD}/relay_target_ips.txt" || true
+        log WARN "Relay target IPs written to: ${OUT_AD}/relay_target_ips.txt"
+    else
+        log OK "All enumerated hosts appear to have SMB signing enabled"
+    fi
+fi
+unset _smb_sweep_ran
 
 # ─── STEP 1.4 — LDAP DC BANNER GRAB (active — quick) ─────────────────────────
 LDAP_OUT="${OUT_AD}/ldap_rootdse.txt"
 if ! skip_if_exists "${LDAP_OUT}" "LDAP rootdse" "ldap_banner"; then
     log INFO "Grabbing LDAP rootdse from DC: ${DC_IP}"
     log_cmd "${NMAP_BIN} -p 389 --script ldap-rootdse ${DC_IP}"
-    "${NMAP_BIN:-nmap}" -p 389 --script ldap-rootdse "${DC_IP}" \
-        -oN "${LDAP_OUT}" 2>&1 | tee -a "${OUT_AD}/ldap.log"
-    log OK "LDAP rootdse collected → ${LDAP_OUT}"
+    # Gate the active NSE probe behind checkpoint() so the operator has an
+    # explicit opt-in for every DC-targeted LDAP probe. `ldap-rootdse` is
+    # low-noise but still generates an authenticated-anonymous LDAP bind
+    # that shows up in DC security logs.
+    if checkpoint "Run LDAP rootDSE banner grab against DC ${DC_IP} (nmap NSE — generates one LDAP probe)?"; then
+        "${NMAP_BIN:-nmap}" -p 389 --script ldap-rootdse "${DC_IP}" \
+            -oN "${LDAP_OUT}" 2>&1 | tee -a "${OUT_AD}/ldap.log"
+        log OK "LDAP rootdse collected → ${LDAP_OUT}"
+    else
+        log INFO "LDAP rootdse skipped — run manually: nmap -p 389 --script ldap-rootdse ${DC_IP}"
+    fi
 fi
 
 # ─── STEP 1.5 — LDAP USER ENUMERATION (active — quick) ───────────────────────
@@ -412,21 +565,9 @@ if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory" "azure_inventory";
     log INFO "Azure inventory running in background (one JSON file per subscription → merged into azure_inventory.json)."
 fi
 
-# ─── CHECK CRITICAL SMB SIGNING FINDING ──────────────────────────────────────
-# Run inline after smb sweep if it's done
-if [[ -f "${SMB_OUT}" ]]; then
-    SIGNING_NOT_REQ=$(grep -c 'signing:False\|SMB signing: disabled\|signing: False' "${SMB_OUT}" 2>/dev/null || true)
-    if [[ "${SIGNING_NOT_REQ}" -gt 0 ]]; then
-        log WARN "FINDING: ${SIGNING_NOT_REQ} host(s) with SMB Signing NOT REQUIRED — relay targets for Phase 3"
-        grep 'signing:False\|signing: False' "${SMB_OUT}" > "${OUT_AD}/relay_targets.txt" 2>/dev/null || true
-        # Extract just IPs for ntlmrelayx
-        awk '{print $2}' "${OUT_AD}/relay_targets.txt" 2>/dev/null | grep -E '^[0-9]+\.' \
-            > "${OUT_AD}/relay_target_ips.txt" || true
-        log WARN "Relay target IPs written to: ${OUT_AD}/relay_target_ips.txt"
-    else
-        log OK "All enumerated hosts appear to have SMB signing enabled"
-    fi
-fi
+# NOTE: SMB signing check previously lived here — moved up to run inline
+# immediately after the SMB sweep's `wait_for_bg_jobs` call (see STEP 1.3)
+# so it is not racing the background job.
 
 # ─── STEP 1.10 — CONTROLLED PASSWORD SPRAY (optional) ───────────────────────
 # Only runs when SPRAY_ENABLED=true in config.env.
@@ -507,9 +648,11 @@ else
             SPRAY_HITS=$(grep -c '(Pwn3d)\|[+] ' "${SPRAY_OUT}" 2>/dev/null || true)
             SPRAY_HITS="${SPRAY_HITS//[^0-9]/}"
             SPRAY_HITS="${SPRAY_HITS:-0}"
-            [[ "${SPRAY_HITS}" -gt 0 ]] && \
-                log WARN "FINDING: ${SPRAY_HITS} account(s) found via password spray → ${SPRAY_OUT}" || \
+            if [[ "${SPRAY_HITS}" -gt 0 ]]; then
+                log WARN "FINDING: ${SPRAY_HITS} account(s) found via password spray → ${SPRAY_OUT}"
+            else
                 log OK "Password spray: no hits with tested passwords"
+            fi
         fi
     fi
 fi

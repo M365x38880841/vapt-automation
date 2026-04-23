@@ -53,15 +53,16 @@ pip_install() {
 }
 
 # ─── SCOUTSUITE INVOCATION HELPER ─────────────────────────────────────────────
-# ScoutSuite's CLI is "scout suite" (two words), not "scout".
+# ScoutSuite's CLI entry point is `scout` (single word), invoked as:
+#   scout azure --tenant <id> --subscription <id> ...
 # Sets global SCOUT_CMD_ARRAY for use as: "${SCOUT_CMD_ARRAY[@]}" azure ...
 set_scout_cmd() {
     if command -v scout &>/dev/null; then
-        SCOUT_CMD_ARRAY=( scout suite )
+        SCOUT_CMD_ARRAY=( scout )
     elif python3 -c "import ScoutSuite" 2>/dev/null; then
         SCOUT_CMD_ARRAY=( python3 -m ScoutSuite )
     else
-        SCOUT_CMD_ARRAY=( scout suite )  # will fail with clear "not found" message
+        SCOUT_CMD_ARRAY=( scout )  # will fail with clear "command not found" message
     fi
 }
 
@@ -183,7 +184,12 @@ check_testing_window() {
     local start="${TESTING_WINDOW_START:-09:00}"
     local end="${TESTING_WINDOW_END:-17:00}"
     # Convert HH:MM to minutes-since-midnight for reliable numeric comparison
-    _hm_to_min() { local h m; IFS=: read -r h m <<< "$1"; echo $(( 10#$h * 60 + 10#$m )); }
+    _hm_to_min() {
+        local h m
+        IFS=: read -r h m <<< "$1"
+        h="${h:-0}"; m="${m:-0}"
+        echo $(( 10#$h * 60 + 10#$m ))
+    }
     local cur_min start_min end_min
     cur_min=$(_hm_to_min "${current_time}")
     start_min=$(_hm_to_min "${start}")
@@ -325,7 +331,11 @@ morning_briefing() {
         [[ -z "$pid" || "$pid" =~ ^# ]] && continue
         # Deduplicate — if the same PID appears twice (phase re-run), show once
         local already_seen=false
-        for s in "${seen_pids[@]:-}"; do [[ "$s" == "$pid" ]] && already_seen=true && break; done
+        if [[ ${#seen_pids[@]} -gt 0 ]]; then
+            for s in "${seen_pids[@]}"; do
+                [[ "$s" == "$pid" ]] && already_seen=true && break
+            done
+        fi
         $already_seen && continue
         seen_pids+=("$pid")
 
@@ -333,7 +343,7 @@ morning_briefing() {
             echo -e "  ${YELLOW}⏳ STILL RUNNING${RESET}  ${BOLD}${name}${RESET} (PID: ${pid})"
             echo -e "     Started:  ${started_at}"
             echo -e "     Log:      ${logfile}"
-            (( running++ )) || true
+            running=$(( running + 1 ))
         else
             echo -e "  ${GREEN}✔  COMPLETED${RESET}    ${BOLD}${name}${RESET} (PID: ${pid})"
             echo -e "     Started:  ${started_at}"
@@ -342,7 +352,7 @@ morning_briefing() {
                 tail_lines=$(tail -3 "${logfile}" 2>/dev/null | grep -v '^$' | sed 's/^/             /')
                 [[ -n "$tail_lines" ]] && echo -e "${tail_lines}"
             fi
-            (( done_count++ )) || true
+            done_count=$(( done_count + 1 ))
         fi
         echo ""
     done < "${BG_JOBS_FILE}"

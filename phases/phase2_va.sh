@@ -46,7 +46,6 @@ fi
 unset _cred_step _cloud_step _needs_domain_creds _needs_cloud_vars
 
 detect_cme
-set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
 
 OUT_AD="${OUTPUT_BASE_DIR}/phase2/ad"
 OUT_CLOUD="${OUTPUT_BASE_DIR}/phase2/cloud"
@@ -74,6 +73,7 @@ if _step_is_skipped "scoutsuite" quiet; then
 elif [[ -z "${AZURE_SUBSCRIPTION_IDS:-}" ]]; then
     log WARN "AZURE_SUBSCRIPTION_IDS not set — scoutsuite skipped."
 else
+set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
 for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
     SCOUT_REPORT_SUB="${SCOUT_REPORT_DIR}/${sub_id}"
     SCOUT_DONE_SUB="${SCOUT_REPORT_SUB}/report.html"
@@ -236,9 +236,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     UNCON_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/unconstrained_delegation.txt" 2>/dev/null || true)
     UNCON_COUNT="${UNCON_COUNT//[^0-9]/}"
     UNCON_COUNT="${UNCON_COUNT:-0}"
-    [[ "${UNCON_COUNT}" -gt 0 ]] && \
-        log WARN "FINDING: ${UNCON_COUNT} computer(s) with unconstrained delegation — see ${AD_CHECKS}/unconstrained_delegation.txt" || \
+    if [[ "${UNCON_COUNT}" -gt 0 ]]; then
+        log WARN "FINDING: ${UNCON_COUNT} computer(s) with unconstrained delegation — see ${AD_CHECKS}/unconstrained_delegation.txt"
+    else
         log OK "No unconstrained delegation computers found (excluding DCs)"
+    fi
 
     # Accounts with password never expires
     log INFO "Checking for 'password never expires' accounts..."
@@ -252,9 +254,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     PNE_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/pwd_never_expires.txt" 2>/dev/null || true)
     PNE_COUNT="${PNE_COUNT//[^0-9]/}"
     PNE_COUNT="${PNE_COUNT:-0}"
-    [[ "${PNE_COUNT}" -gt 0 ]] && \
-        log WARN "FINDING: ${PNE_COUNT} account(s) with 'password never expires'" || \
+    if [[ "${PNE_COUNT}" -gt 0 ]]; then
+        log WARN "FINDING: ${PNE_COUNT} account(s) with 'password never expires'"
+    else
         log OK "No password-never-expires accounts found"
+    fi
 
     # ── AD Certificate Services (AD CS) vulnerability enumeration ──────────────
     # Covers ESC1–ESC8: misconfigured certificate templates & CA permissions.
@@ -276,9 +280,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
             ADCS_VULN=$(grep -c 'ESC[0-9]\|Enabled.*True\|Client Authentication' "${ADCS_OUT}/adcs_find.txt" 2>/dev/null || true)
             ADCS_VULN="${ADCS_VULN//[^0-9]/}"
             ADCS_VULN="${ADCS_VULN:-0}"
-            [[ "${ADCS_VULN}" -gt 0 ]] && \
-                log WARN "FINDING: ${ADCS_VULN} potential AD CS misconfiguration(s) — review ${ADCS_OUT}/adcs_find.txt" || \
+            if [[ "${ADCS_VULN}" -gt 0 ]]; then
+                log WARN "FINDING: ${ADCS_VULN} potential AD CS misconfiguration(s) — review ${ADCS_OUT}/adcs_find.txt"
+            else
                 log OK "No obvious AD CS ESC misconfigurations detected"
+            fi
         fi
     else
         log WARN "certipy-ad not installed — AD CS enumeration skipped. Install: pip3 install certipy-ad --break-system-packages"
@@ -300,9 +306,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         VULN_HITS=$(grep -ci 'vulnerable\|VULNERABLE' "${SMB_VULN_OUT}" 2>/dev/null || true)
         VULN_HITS="${VULN_HITS//[^0-9]/}"
         VULN_HITS="${VULN_HITS:-0}"
-        [[ "${VULN_HITS}" -gt 0 ]] && \
-            log WARN "FINDING: ${VULN_HITS} SMB vulnerability module hit(s) → ${SMB_VULN_OUT}" || \
+        if [[ "${VULN_HITS}" -gt 0 ]]; then
+            log WARN "FINDING: ${VULN_HITS} SMB vulnerability module hit(s) → ${SMB_VULN_OUT}"
+        else
             log OK "No SMB vulnerability module hits detected"
+        fi
     fi
 
     touch "${AD_CHECKS}/done.flag"

@@ -203,8 +203,8 @@ STEP_CRED_REQUIREMENTS: dict[int, dict[str, list[str]]] = {
     },
     4: {
         "sam_sweep":          ["OBTAINED_HASH"],
-        "lateral_move":       ["OBTAINED_HASH"],
-        "dcsync":             ["OBTAINED_HASH"],
+        "lateral_move":       ["DOMAIN_USER", "DOMAIN_PASS", "OBTAINED_HASH"],
+        "dcsync":             ["DOMAIN_USER", "DOMAIN_PASS", "OBTAINED_HASH"],
         "azure_blast_radius": [],
         "blast_summary":      [],
     },
@@ -405,6 +405,8 @@ def run_phase(phase_num: int, config: dict, creds: dict, dry_run: bool, log_file
     env["PHASE_NUM"] = str(phase_num)
     env["LOG_FILE"] = str(log_file)
     env["DRY_RUN"] = "false"
+    # dry_run never reaches subprocess.run so AUTO_APPROVE in env is unused;
+    # kept for forward-compatibility if dry-run ever executes a no-op subprocess.
     env["AUTO_APPROVE"] = "true" if dry_run else env.get("AUTO_APPROVE", "false")
     if skip:
         env["SKIP_STEPS"] = skip

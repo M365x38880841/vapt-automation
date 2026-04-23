@@ -1,8 +1,40 @@
 # ============================================================================
 # BloodHound Community Edition — Docker Compose stack
 # Usage: docker compose up -d
-# Web UI: http://localhost:8080  (default creds: admin / [generated on first run])
+# Web UI: http://localhost:8888  (default creds: admin / [generated on first run])
 # ============================================================================
+#
+# HOST PORT MAP (all bound to 127.0.0.1 — never exposed on 0.0.0.0):
+#   127.0.0.1:55432  → app-db      (Postgres) — debug only; BHCE connects via 172.28.1.2:5432
+#   127.0.0.1:7687   → graph-db    (Neo4j bolt) — operator bolt client access
+#   127.0.0.1:7474   → graph-db    (Neo4j browser UI)
+#   127.0.0.1:8888   → bloodhound  (BloodHound CE web UI)
+#
+# Rationale for non-standard host ports:
+#   - 55432 (not 5432): Kali ships with Postgres enabled by default on 5432.
+#     Publishing 5432 causes `bind: address already in use` on fresh installs.
+#     55432 is in the ephemeral range yet above all common service ports.
+#   - 8888 (not 8080): 8080 is heavily contested on pentest boxes (Burp,
+#     dev servers, corp proxies). 8888 rarely collides.
+#   Container-to-container traffic is unaffected — it flows over the bhce
+#   bridge using the static IPv4 addresses below.
+#
+# ── Subnet-conflict note ───────────────────────────────────────────────────
+# The 172.28.1.0/24 subnet below can collide with:
+#   (a) Existing Docker networks on the host (docker network ls)
+#   (b) VPN routes common on pentest boxes — OpenVPN/WireGuard engagements
+#       frequently use 172.16.0.0/12 space for client tunnels.
+# If a collision occurs, Docker will fail to create the network OR the
+# bridge will black-hole traffic intended for the VPN peer.
+# Check before `docker compose up -d`:
+#   docker network ls --format '{{.Name}}: {{.Driver}}'
+#   ip route | grep 172.28
+# If either lists a conflicting entry, pick a free /24 (e.g. 10.77.7.0/24
+# or 192.168.77.0/24) and update BOTH:
+#   - networks.bhce.ipam.config[0].subnet + .gateway below
+#   - Every service's networks.bhce.ipv4_address
+#   - tools/bloodhound-ce/bloodhound.config.json (postgres host + bolt URL)
+# phase0_setup.sh runs an automated check for this subnet before startup.
 
 networks:
   # Named bridge network with an explicit IPv4-only IPAM block.
@@ -27,7 +59,7 @@ services:
       POSTGRES_PASSWORD: bloodhoundcommunityedition
       POSTGRES_DB: bloodhound
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     networks:
@@ -127,7 +159,8 @@ services:
     volumes:
       - ./bloodhound.config.json:/bloodhound.config.json:ro
     ports:
-      - "127.0.0.1:8080:8080"
+      # SYNC: phase0_setup.sh polls localhost:8888 — must match this port
+      - "127.0.0.1:8888:8080"
     networks:
       bhce:
         ipv4_address: 172.28.1.4

@@ -18,34 +18,77 @@ mkdir -p "${EVIDENCE_DIR}"/{network,ad,cloud,web,cracked}
 # ─── COLLECT ALL EVIDENCE FILES ──────────────────────────────────────────────
 log INFO "Consolidating evidence files from all phases..."
 
-cp -u "${OUTPUT_BASE_DIR}"/phase1/network/fullscan.* "${EVIDENCE_DIR}/network/" 2>/dev/null \
-    && log OK "Nmap full scan copied" || log WARN "Nmap full scan not yet available — skipping"
+if ls "${OUTPUT_BASE_DIR}"/phase1/network/fullscan.* 2>/dev/null | head -1 | grep -q .; then
+    cp -u "${OUTPUT_BASE_DIR}"/phase1/network/fullscan.* "${EVIDENCE_DIR}/network/" 2>/dev/null || true
+    log OK "Nmap full scan copied"
+else
+    log WARN "Nmap full scan not yet available — skipping"
+fi
 
-cp -u "${OUTPUT_BASE_DIR}"/phase1/ad/bloodhound/*.zip "${EVIDENCE_DIR}/ad/" 2>/dev/null \
-    && log OK "BloodHound ZIPs copied" || log WARN "BloodHound ZIPs not found — skipping"
+if ls "${OUTPUT_BASE_DIR}"/phase1/ad/bloodhound/*.zip 2>/dev/null | head -1 | grep -q .; then
+    cp -u "${OUTPUT_BASE_DIR}"/phase1/ad/bloodhound/*.zip "${EVIDENCE_DIR}/ad/" 2>/dev/null || true
+    log OK "BloodHound ZIPs copied"
+else
+    log WARN "BloodHound ZIPs not found — skipping"
+fi
 
 # ScoutSuite writes per-subscription: scoutsuite/<sub_id>/report.html — use wildcard.
-find "${OUTPUT_BASE_DIR}/phase2/cloud/scoutsuite" -name 'report.html' -exec cp -u {} "${EVIDENCE_DIR}/cloud/" \; 2>/dev/null \
-    && log OK "ScoutSuite report(s) copied" || log WARN "ScoutSuite reports not found — skipping"
+if [[ -d "${OUTPUT_BASE_DIR}/phase2/cloud/scoutsuite" ]] \
+    && find "${OUTPUT_BASE_DIR}/phase2/cloud/scoutsuite" -name 'report.html' 2>/dev/null | head -1 | grep -q .; then
+    find "${OUTPUT_BASE_DIR}/phase2/cloud/scoutsuite" -name 'report.html' -exec cp -u {} "${EVIDENCE_DIR}/cloud/" \; 2>/dev/null || true
+    log OK "ScoutSuite report(s) copied"
+else
+    log WARN "ScoutSuite reports not found — skipping"
+fi
 
-cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/cracked_*.txt "${EVIDENCE_DIR}/cracked/" 2>/dev/null \
-    && log OK "Cracked credentials copied" || log WARN "No cracked credential files yet — skipping"
+if ls "${OUTPUT_BASE_DIR}"/phase3/ad/cracked_*.txt 2>/dev/null | head -1 | grep -q .; then
+    cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/cracked_*.txt "${EVIDENCE_DIR}/cracked/" 2>/dev/null || true
+    log OK "Cracked credentials copied"
+else
+    log WARN "No cracked credential files yet — skipping"
+fi
 
 cp -u "${OUTPUT_BASE_DIR}"/phase3/ad/responder_session.log "${EVIDENCE_DIR}/ad/" 2>/dev/null || true
 cp -u "${OUTPUT_BASE_DIR}"/phase3/cloud/public_blob_poc.txt "${EVIDENCE_DIR}/cloud/" 2>/dev/null || true
 cp -u "${OUTPUT_BASE_DIR}"/phase4/ad/dcsync_poc.txt "${EVIDENCE_DIR}/ad/" 2>/dev/null || true
-cp -u "${OUTPUT_BASE_DIR}"/phase4/blast_radius/summary.md "${EVIDENCE_DIR}/" 2>/dev/null || true
+cp -u "${OUTPUT_BASE_DIR}"/phase4/blast_radius/blast_radius_summary.md "${EVIDENCE_DIR}/" 2>/dev/null || true
 
 # ─── COUNT FINDINGS FROM AUTOMATED OUTPUTS ────────────────────────────────────
-KERB_COUNT=$(grep -c 'krb5tgs'   "${EVIDENCE_DIR}/cracked/cracked_tgs.txt"   2>/dev/null || echo 0)
-ASREP_COUNT=$(grep -c 'krb5asrep' "${OUTPUT_BASE_DIR}/phase3/ad/cracked_asrep.txt" 2>/dev/null || echo 0)
-CRACKED_NTLM_COUNT=$(wc -l < "${EVIDENCE_DIR}/cracked/cracked_ntlm.txt" 2>/dev/null || echo 0)
-PTH_COUNT=$(wc -l < "${OUTPUT_BASE_DIR}/phase3/ad/pth_accessible_hosts.txt" 2>/dev/null || echo 0)
-PUBLIC_BLOBS=$(grep -c 'CRITICAL' "${EVIDENCE_DIR}/cloud/public_blob_poc.txt" 2>/dev/null || echo 0)
-UNCON_DELEG=$(grep -c 'sAMAccountName' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/unconstrained_delegation.txt" 2>/dev/null || echo 0)
-PNE_COUNT=$(grep -c 'sAMAccountName' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/pwd_never_expires.txt" 2>/dev/null || echo 0)
-ADCS_HITS=$(grep -c 'ESC[0-9]\|Enabled.*True' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/adcs/adcs_find.txt" 2>/dev/null || echo 0)
-SMB_VULN_HITS=$(grep -ci 'vulnerable' "${OUTPUT_BASE_DIR}/phase2/network/smb_vuln_checks.txt" 2>/dev/null || echo 0)
+KERB_COUNT=$(grep -c 'krb5tgs'   "${EVIDENCE_DIR}/cracked/cracked_tgs.txt"   2>/dev/null || true)
+KERB_COUNT="${KERB_COUNT//[^0-9]/}"
+KERB_COUNT="${KERB_COUNT:-0}"
+
+ASREP_COUNT=$(grep -c 'krb5asrep' "${OUTPUT_BASE_DIR}/phase3/ad/cracked_asrep.txt" 2>/dev/null || true)
+ASREP_COUNT="${ASREP_COUNT//[^0-9]/}"
+ASREP_COUNT="${ASREP_COUNT:-0}"
+
+CRACKED_NTLM_COUNT=$(wc -l < "${EVIDENCE_DIR}/cracked/cracked_ntlm.txt" 2>/dev/null || true)
+CRACKED_NTLM_COUNT="${CRACKED_NTLM_COUNT//[^0-9]/}"
+CRACKED_NTLM_COUNT="${CRACKED_NTLM_COUNT:-0}"
+
+PTH_COUNT=$(wc -l < "${OUTPUT_BASE_DIR}/phase3/ad/pth_accessible_hosts.txt" 2>/dev/null || true)
+PTH_COUNT="${PTH_COUNT//[^0-9]/}"
+PTH_COUNT="${PTH_COUNT:-0}"
+
+PUBLIC_BLOBS=$(grep -c 'CRITICAL' "${EVIDENCE_DIR}/cloud/public_blob_poc.txt" 2>/dev/null || true)
+PUBLIC_BLOBS="${PUBLIC_BLOBS//[^0-9]/}"
+PUBLIC_BLOBS="${PUBLIC_BLOBS:-0}"
+
+UNCON_DELEG=$(grep -c 'sAMAccountName' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/unconstrained_delegation.txt" 2>/dev/null || true)
+UNCON_DELEG="${UNCON_DELEG//[^0-9]/}"
+UNCON_DELEG="${UNCON_DELEG:-0}"
+
+PNE_COUNT=$(grep -c 'sAMAccountName' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/pwd_never_expires.txt" 2>/dev/null || true)
+PNE_COUNT="${PNE_COUNT//[^0-9]/}"
+PNE_COUNT="${PNE_COUNT:-0}"
+
+ADCS_HITS=$(grep -c 'ESC[0-9]\|Enabled.*True' "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/adcs/adcs_find.txt" 2>/dev/null || true)
+ADCS_HITS="${ADCS_HITS//[^0-9]/}"
+ADCS_HITS="${ADCS_HITS:-0}"
+
+SMB_VULN_HITS=$(grep -ci 'vulnerable' "${OUTPUT_BASE_DIR}/phase2/network/smb_vuln_checks.txt" 2>/dev/null || true)
+SMB_VULN_HITS="${SMB_VULN_HITS//[^0-9]/}"
+SMB_VULN_HITS="${SMB_VULN_HITS:-0}"
 
 # Copy AD CS and SMB vuln evidence
 cp -u "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/adcs/"* "${EVIDENCE_DIR}/ad/" 2>/dev/null && log OK "AD CS certipy output copied" || true
@@ -54,7 +97,12 @@ cp -u "${OUTPUT_BASE_DIR}/phase2/network/smb_vuln_checks.txt" "${EVIDENCE_DIR}/n
 if [[ -d "${OUTPUT_BASE_DIR}/phase2/web/zap" ]]; then
     cp -ur "${OUTPUT_BASE_DIR}/phase2/web/zap" "${EVIDENCE_DIR}/web/" 2>/dev/null && log OK "ZAP DAST reports copied" || true
 fi
-ZAP_TARGET_COUNT=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.html' 2>/dev/null | wc -l || echo 0)
+ZAP_TARGET_COUNT=0
+if [[ -d "${OUTPUT_BASE_DIR}/phase2/web/zap" ]]; then
+    ZAP_TARGET_COUNT=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.html' 2>/dev/null | wc -l || true)
+    ZAP_TARGET_COUNT="${ZAP_TARGET_COUNT//[^0-9]/}"
+    ZAP_TARGET_COUNT="${ZAP_TARGET_COUNT:-0}"
+fi
 ZAP_HIGH_ALERTS=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.json' \
     -exec python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sum(len(s.get('alerts',[])) for s in d.get('site',[]) if s.get('alerts')))" {} \; 2>/dev/null \
     | awk '{s+=$1} END{print s+0}')

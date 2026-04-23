@@ -252,7 +252,7 @@ log INFO "Checking ScoutSuite invocation..."
 if ! pip_install scoutsuite 2>/dev/null; then
     log WARN "ScoutSuite install failed — Phase 2 cloud audit will be skipped"
 fi
-# Validate the correct "scout suite" invocation (not bare "scout")
+# Validate scout invocation: ScoutSuite installs as `scout` (single word, not "scout suite")
 set_scout_cmd
 if "${SCOUT_CMD_ARRAY[@]}" --help &>/dev/null 2>&1; then
     log OK "ScoutSuite invocation confirmed: ${SCOUT_CMD_ARRAY[*]}"
@@ -335,15 +335,15 @@ if grep -q "${PLACEHOLDER}" "${BHCE_CONFIG}" 2>/dev/null; then
     log WARN "BloodHound CE config contains placeholder JWT signing key — generating secure key..."
     NEW_KEY=$(openssl rand -hex 32)
     # Replace both occurrences (jwt_signing_key top-level + crypto.jwt.signing_key)
-    sed -i "s/${PLACEHOLDER}/${NEW_KEY}/g" "${BHCE_CONFIG}"
+    sed -i "s|${PLACEHOLDER}|${NEW_KEY}|g" "${BHCE_CONFIG}"
     log OK "JWT signing key set (${#NEW_KEY}-char hex). Keep ${BHCE_CONFIG} private."
 fi
 
 # Check if stack is already running (covers both fresh start and resume after reboot)
 if "${DC[@]}" -f "${BHCE_COMPOSE}" ps 2>/dev/null | grep -qE 'running|Up|healthy'; then
-    log OK "BloodHound CE stack already running → http://localhost:8080"
+    log OK "BloodHound CE stack already running → http://localhost:8888"
 else
-    if checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8080)?"; then
+    if checkpoint "Start BloodHound CE Docker stack (Postgres + Neo4j + BloodHound UI on :8888)?"; then
         # ── Stale Neo4j volume guard (fixes "too many colons in address") ─────
         # Neo4j persists its cluster routing table inside the /data volume. If
         # a previous run advertised the container hostname (or defaulted to it)
@@ -401,7 +401,7 @@ else
 
         # ── Wait for Neo4j bolt port (tcp://localhost:7687) FIRST ─────────────
         # BloodHound's graph_db client dials bolt://172.28.1.3:7687 well before
-        # it ever binds the HTTP :8080 listener. If the bolt port is not
+        # it ever binds the HTTP :8888 listener. If the bolt port is not
         # accepting connections — e.g. Neo4j crashed on the IPv6-mapped address
         # error, the listen address is wrong, or the JVM is still initialising
         # — BloodHound exits/crash-loops and /api/version will never respond.
@@ -416,11 +416,13 @@ else
         bolt_wait=0
         bolt_ready=false
         while [[ $bolt_wait -lt 120 ]]; do
+            # bash /dev/tcp pseudo-device: opens a TCP socket without requiring nc/ncat.
+            # The subshell prevents the failed-open exit from tripping set -e in the caller.
             if (echo > /dev/tcp/localhost/7687) 2>/dev/null; then
                 bolt_ready=true
                 break
             fi
-            sleep 3; (( bolt_wait += 3 ))
+            sleep 3; bolt_wait=$(( bolt_wait + 3 ))
             [[ $(( bolt_wait % 30 )) -eq 0 ]] && log INFO "  bolt not ready yet... (${bolt_wait}s elapsed)"
         done
         if $bolt_ready; then
@@ -439,16 +441,16 @@ else
         bh_wait=0
         bh_ready=false
         while [[ $bh_wait -lt 180 ]]; do
-            if curl -sf --max-time 3 "http://localhost:8080/api/version" &>/dev/null; then
+            if curl -sf --max-time 3 "http://localhost:8888/api/version" &>/dev/null; then
                 bh_ready=true
                 break
             fi
-            sleep 5; (( bh_wait += 5 ))
+            sleep 5; bh_wait=$(( bh_wait + 5 ))
             [[ $(( bh_wait % 30 )) -eq 0 ]] && log INFO "  Still waiting... (${bh_wait}s elapsed)"
         done
 
         if $bh_ready; then
-            log OK "BloodHound CE is serving → http://localhost:8080 (${bh_wait}s)"
+            log OK "BloodHound CE is serving → http://localhost:8888 (${bh_wait}s)"
 
             # ── Post-HTTP sanity: detect silent crash-looping containers ──────
             # BloodHound can return 200 on /api/version even when its Neo4j
@@ -473,10 +475,10 @@ else
                 rcount=$(docker inspect -f '{{.RestartCount}}' "$cid" 2>/dev/null || echo 0)
                 rcount="${rcount//[^0-9]/}"
                 rcount="${rcount:-0}"
-                if (( rcount >= 3 )); then
+                if [[ "${rcount}" -ge 3 ]]; then
                     log WARN "  Container ${cname} has restarted ${rcount} times — crash loop likely."
                     unstable=true
-                elif (( rcount > 0 )); then
+                elif [[ "${rcount}" -gt 0 ]]; then
                     log INFO "  Container ${cname}: restart count ${rcount} (tolerable)."
                 else
                     log OK "  Container ${cname}: stable (0 restarts)."
