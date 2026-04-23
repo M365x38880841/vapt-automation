@@ -126,6 +126,23 @@ https://download.docker.com/linux/debian bookworm stable" \
         sudo usermod -aG docker "$USER" 2>/dev/null || true
         log WARN "User '${USER}' added to docker group. Run 'newgrp docker' for passwordless docker in this session."
     fi
+
+    # ── Force IPv4 for Docker image pulls ───────────────────────────────────
+    # On hosts without IPv6 internet routing (common on pentest boxes and VMs),
+    # Docker resolves registry hostnames to AAAA records first and tries IPv6,
+    # failing with "dial tcp [2606:...]:443: connect: network is unreachable"
+    # after 6 attempts.  Setting "ipv6": false in daemon.json makes Docker skip
+    # IPv6 addresses entirely so pulls always succeed over IPv4.
+    local daemon_json="/etc/docker/daemon.json"
+    if [[ ! -f "${daemon_json}" ]]; then
+        log INFO "Creating ${daemon_json} with IPv4-only pull preference..."
+        echo '{"ipv6": false}' | sudo tee "${daemon_json}" > /dev/null
+        sudo systemctl restart docker 2>/dev/null \
+            || sudo service docker restart 2>/dev/null || true
+        log OK "Docker daemon configured: IPv6 disabled (image pulls use IPv4 only)"
+    elif ! grep -q '"ipv6"' "${daemon_json}" 2>/dev/null; then
+        log WARN "${daemon_json} exists but has no ipv6 setting — add '\"ipv6\": false' manually if image pulls fail with IPv6 errors."
+    fi
 }
 
 ensure_docker
