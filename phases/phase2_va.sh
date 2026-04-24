@@ -19,6 +19,7 @@ log PHASE "Phase 2 — Vulnerability Assessment"
 check_testing_window
 
 require_var "DOMAIN_NAME"; require_var "DC_IP"
+set_primary_dc
 
 # Conditional credential / cloud-var requirements.
 # Pre-flight probe: inspect each step's skip state QUIETLY (no SKIP log lines
@@ -173,10 +174,10 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
 
     # Kerberoastable accounts check (Phase 2 identification, not yet exploiting)
     log INFO "Identifying Kerberoastable accounts..."
-    log_cmd "impacket-GetUserSPNs ${DOMAIN_NAME}/${DOMAIN_USER} -dc-ip ${DC_IP}"
+    log_cmd "impacket-GetUserSPNs ${DOMAIN_NAME}/${DOMAIN_USER} -dc-ip ${PRIMARY_DC}"
     impacket-GetUserSPNs \
         "${DOMAIN_NAME}/${DOMAIN_USER}:${DOMAIN_PASS}" \
-        -dc-ip "${DC_IP}" \
+        -dc-ip "${PRIMARY_DC}" \
         2>&1 > "${AD_CHECKS}/kerberoastable_accounts.txt" || true
     # `grep -c` prints "0" and exits 1 on no-match, so `|| echo 0` double-counts
     # the stdout; strip non-digits so the value is a safe scalar for downstream
@@ -193,7 +194,7 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         "${DOMAIN_NAME}/" \
         -no-pass \
         -usersfile "${OUTPUT_BASE_DIR}/phase1/ad/userlist.txt" \
-        -dc-ip "${DC_IP}" \
+        -dc-ip "${PRIMARY_DC}" \
         -format hashcat \
         2>&1 > "${AD_CHECKS}/asrep_accounts.txt" || true
     ASREP_COUNT=$(grep -c 'krb5asrep' "${AD_CHECKS}/asrep_accounts.txt" 2>/dev/null || true)
@@ -203,8 +204,8 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
 
     # Password policy check
     log INFO "Extracting domain password policy..."
-    log_cmd "${CME_BIN} smb ${DC_IP} -u ... -d ${DOMAIN_NAME} --pass-pol"
-    "${CME_BIN}" smb "${DC_IP}" \
+    log_cmd "${CME_BIN} smb ${PRIMARY_DC} -u ... -d ${DOMAIN_NAME} --pass-pol"
+    "${CME_BIN}" smb "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --pass-pol \
         2>&1 > "${AD_CHECKS}/password_policy.txt" || true
@@ -212,21 +213,21 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
 
     # Enumerate shares
     log INFO "Enumerating accessible shares..."
-    "${CME_BIN}" smb "${DC_IP}" \
+    "${CME_BIN}" smb "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --shares \
         2>&1 > "${AD_CHECKS}/shares.txt" || true
 
     # Check for accounts with no pre-auth (AS-REP using CME)
     log INFO "Checking admin group members..."
-    "${CME_BIN}" smb "${DC_IP}" \
+    "${CME_BIN}" smb "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --groups "Domain Admins" \
         2>&1 > "${AD_CHECKS}/domain_admins.txt" || true
 
     # Unconstrained delegation check via LDAP
     log INFO "Checking for unconstrained delegation..."
-    ldapsearch -H "ldap://${DC_IP}" \
+    ldapsearch -H "ldap://${PRIMARY_DC}" \
         -D "${DOMAIN_USER}@${DOMAIN_NAME}" \
         -w "${DOMAIN_PASS}" \
         -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
@@ -244,7 +245,7 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
 
     # Accounts with password never expires
     log INFO "Checking for 'password never expires' accounts..."
-    ldapsearch -H "ldap://${DC_IP}" \
+    ldapsearch -H "ldap://${PRIMARY_DC}" \
         -D "${DOMAIN_USER}@${DOMAIN_NAME}" \
         -w "${DOMAIN_PASS}" \
         -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
@@ -269,11 +270,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     if [[ -n "${CERTIPY_CMD}" ]]; then
         if ! skip_if_exists "${ADCS_OUT}/adcs_find.txt" "AD CS ESC vulnerability scan"; then
             log INFO "Running Certipy AD CS enumeration (ESC1–ESC8 checks)..."
-            log_cmd "${CERTIPY_CMD} find -u ${DOMAIN_USER}@${DOMAIN_NAME} -p *** -dc-ip ${DC_IP} -vulnerable"
+            log_cmd "${CERTIPY_CMD} find -u ${DOMAIN_USER}@${DOMAIN_NAME} -p *** -dc-ip ${PRIMARY_DC} -vulnerable"
             "${CERTIPY_CMD}" find \
                 -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
                 -p "${DOMAIN_PASS}" \
-                -dc-ip "${DC_IP}" \
+                -dc-ip "${PRIMARY_DC}" \
                 -vulnerable \
                 -output "${ADCS_OUT}/adcs" \
                 2>&1 | tee "${ADCS_OUT}/adcs_find.txt" || true

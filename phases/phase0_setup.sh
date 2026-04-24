@@ -443,13 +443,16 @@ else
     fi
 fi
 
-# ─── VALIDATE SUBNET REACHABILITY ────────────────────────────────────────────
-log INFO "Validating DC reachability: ${DC_IP}"
-if ping -c 2 -W 2 "${DC_IP}" &>/dev/null; then
-    log OK "DC is reachable: ${DC_IP}"
-else
-    log WARN "DC not responding to ping (may be ICMP-blocked). Will verify via Nmap in Phase 1."
-fi
+# ─── VALIDATE DC REACHABILITY ────────────────────────────────────────────────
+log INFO "Validating DC reachability (all DCs in DC_IP)..."
+for _dc in ${DC_IP}; do
+    if ping -c 2 -W 2 "${_dc}" &>/dev/null; then
+        log OK "DC reachable: ${_dc}"
+    else
+        log WARN "DC not responding to ping (may be ICMP-blocked): ${_dc} — will verify via Nmap in Phase 1."
+    fi
+done
+unset _dc
 
 # ─── WRITE SCOPE FILE FOR SUBSEQUENT PHASES ──────────────────────────────────
 SCOPE_FILE="${OUTPUT_BASE_DIR}/phase0/scope.json"

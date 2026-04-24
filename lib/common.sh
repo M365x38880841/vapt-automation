@@ -377,6 +377,22 @@ notify_complete() {
     fi
 }
 
+# ─── PRIMARY DC HELPER ────────────────────────────────────────────────────────
+# DC_IP is a space-separated list (e.g. "10.10.1.10 10.10.1.11").
+# Most tools accept only a single -dc-ip / -ns / ldap:// target — use the
+# first IP for those.  Iterate over ${DC_IP} for checks covering every DC.
+# Call this once near the top of each phase script after require_var "DC_IP".
+set_primary_dc() {
+    PRIMARY_DC="${DC_IP%% *}"
+    export PRIMARY_DC
+    if [[ "${DC_IP}" != "${PRIMARY_DC}" ]]; then
+        log INFO "Multiple DCs configured. Primary DC: ${PRIMARY_DC}"
+        log INFO "All DCs: ${DC_IP}"
+    else
+        log INFO "DC: ${PRIMARY_DC}"
+    fi
+}
+
 # ─── RUNTIME SECRET PROMPT ────────────────────────────────────────────────────
 # Usage: prompt_secret VAR_NAME "Prompt text"
 # Sets the variable in the calling environment

