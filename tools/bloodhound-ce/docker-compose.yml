@@ -74,26 +74,26 @@ services:
     restart: unless-stopped
 
   graph-db:
-    # Neo4j 4.4 is SpecterOps' documented minimum for BloodHound CE. Neo4j 5.x
-    # is also supported and sidesteps most of the IPv6 routing-table quirks
-    # fixed below — if you hit persistent bolt issues, bump this to neo4j:5.
-    # Upgrade path: stop the stack, wipe the neo4j-data volume (see phase0),
-    # switch the tag, and restart. Credentials and config stay the same.
-    image: docker.io/library/neo4j:4.4
-    # Explicit hostname so Neo4j always advertises "graph-db" in its routing
-    # table response — regardless of the container's short ID hostname.
-    # BloodHound's Go bolt driver receives "graph-db:7687" from the routing
-    # table, resolves it via Docker's embedded DNS (127.0.0.11), and gets the
-    # static IPv4 address 172.28.1.3 — no IPv6 involvement, no colon error.
-    # This is the same approach used in SpecterOps' official docker-compose.
-    # All NEO4J_ env vars for advertised_address have been removed because
-    # Neo4j 4.4 ignores them in practice (the log still shows the container
-    # hostname despite setting them) — hostname: is the reliable mechanism.
+    # Neo4j 5 — upgraded from 4.4 because 4.4 ignores NEO4J_* env vars for
+    # the bolt advertised address in practice: the routing table always
+    # returns the JVM's dual-stack listen socket (::7687) regardless of any
+    # dbms.connector.bolt.advertised_address or dbms.default_advertised_address
+    # setting, causing BloodHound's Go driver to fail with "too many colons".
+    # Neo4j 5 honours server.bolt.advertised_address reliably.
+    # Property naming in Neo4j 5 env vars: dots→_, underscores→__, prefix NEO4J_
+    image: docker.io/library/neo4j:5
     hostname: graph-db
     environment:
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
-      NEO4J_dbms_allow__upgrade: "true"
-      NEO4J_dbms_jvm_additional: "-Djava.net.preferIPv4Stack=true"
+      # Force the routing table to advertise the stable Docker service hostname.
+      # BloodHound's Go bolt driver resolves "graph-db" via Docker's embedded
+      # DNS (127.0.0.11) which returns 172.28.1.3 (IPv4) because enable_ipv6
+      # is false on this network — no ::7687 colon error possible.
+      NEO4J_server_default__advertised__address: "graph-db"
+      NEO4J_server_bolt_advertised__address: "graph-db:7687"
+      NEO4J_server_bolt_listen__address: "0.0.0.0:7687"
+      NEO4J_server_http_listen__address: "0.0.0.0:7474"
+      NEO4J_server_jvm_additional: "-Djava.net.preferIPv4Stack=true"
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7474:7474"
@@ -103,23 +103,10 @@ services:
       bhce:
         ipv4_address: 172.28.1.3
     healthcheck:
-      # A TCP probe against the HTTP browser (7474) only proves the JVM is up
-      # and the web connector is bound — NOT that the bolt connector (7687) is
-      # accepting connections. BloodHound speaks bolt, not HTTP, so the gate
-      # on `depends_on: service_healthy` MUST verify bolt readiness or else
-      # BloodHound starts too early and fails its initial Neo4j handshake.
-      # /dev/tcp is a bash builtin that opens a socket without needing nc/ncat
-      # (neither are installed in the default neo4j image). We invoke bash
-      # explicitly because CMD-SHELL uses /bin/sh → dash on Debian, and dash
-      # does NOT implement the /dev/tcp pseudo-device.
       test: ["CMD", "bash", "-c", "wget -q -O /dev/null http://localhost:7474 && (echo > /dev/tcp/localhost/7687) 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
-      # Neo4j 4.4 first-boot initialization (creating the data directory, applying
-      # allow__upgrade, binding connectors) can exceed the prior 90s budget on
-      # slower hosts and cold image pulls — bumping to 120s prevents spurious
-      # "unhealthy" flips that stall BloodHound's `depends_on: service_healthy`.
       start_period: 120s
     restart: unless-stopped
 
