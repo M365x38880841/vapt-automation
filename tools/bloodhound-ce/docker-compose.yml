@@ -83,16 +83,16 @@ services:
     # Property naming in Neo4j 5 env vars: dots→_, underscores→__, prefix NEO4J_
     image: docker.io/library/neo4j:5
     hostname: graph-db
+    # extra_hosts writes directly to /etc/hosts inside the Neo4j container.
+    # This guarantees InetAddress.getLocalHost() returns 172.28.1.3 (IPv4)
+    # when Neo4j looks up its own hostname to populate the bolt routing table.
+    # Without this, Docker DNS may return :: (IPv6) for "graph-db" even on an
+    # IPv4-only network, causing the routing table to advertise ::7687 and
+    # BloodHound's Go driver to fail with "too many colons in address".
+    extra_hosts:
+      - "graph-db:172.28.1.3"
     environment:
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
-      # Force the routing table to advertise the stable Docker service hostname.
-      # BloodHound's Go bolt driver resolves "graph-db" via Docker's embedded
-      # DNS (127.0.0.11) which returns 172.28.1.3 (IPv4) because enable_ipv6
-      # is false on this network — no ::7687 colon error possible.
-      NEO4J_server_default__advertised__address: "graph-db"
-      NEO4J_server_bolt_advertised__address: "graph-db:7687"
-      NEO4J_server_bolt_listen__address: "0.0.0.0:7687"
-      NEO4J_server_http_listen__address: "0.0.0.0:7474"
       NEO4J_server_jvm_additional: "-Djava.net.preferIPv4Stack=true"
     ports:
       - "127.0.0.1:7687:7687"
@@ -114,6 +114,11 @@ services:
     image: specterops/bloodhound:latest
     environment:
       - bloodhound_config_path=/bloodhound.config.json
+    # Force graph-db and app-db to resolve to IPv4 inside the BloodHound
+    # container — belt-and-braces against Docker DNS returning IPv6 addresses.
+    extra_hosts:
+      - "graph-db:172.28.1.3"
+      - "app-db:172.28.1.2"
     volumes:
       - ./bloodhound.config.json:/bloodhound.config.json:ro
     ports:

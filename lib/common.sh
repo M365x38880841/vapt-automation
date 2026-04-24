@@ -298,7 +298,7 @@ wait_for_bg_jobs() {
 
 status_bg_jobs() {
     echo -e "\n${CYAN}Background Job Status (in-session):${RESET}"
-    if [[ ${#BG_JOB_PIDS[@]:-0} -eq 0 ]]; then
+    if [[ ${#BG_JOB_PIDS[@]} -eq 0 ]]; then
         echo -e "  No jobs tracked in this session."
         return 0
     fi
