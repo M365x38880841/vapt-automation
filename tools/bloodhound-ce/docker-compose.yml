@@ -74,31 +74,23 @@ services:
     restart: unless-stopped
 
   graph-db:
-    # Neo4j 5 — upgraded from 4.4 because 4.4 ignores NEO4J_* env vars for
-    # the bolt advertised address in practice: the routing table always
-    # returns the JVM's dual-stack listen socket (::7687) regardless of any
-    # dbms.connector.bolt.advertised_address or dbms.default_advertised_address
-    # setting, causing BloodHound's Go driver to fail with "too many colons".
-    # Neo4j 5 honours server.bolt.advertised_address reliably.
-    # Property naming in Neo4j 5 env vars: dots→_, underscores→__, prefix NEO4J_
+    # Neo4j 5. Config is supplied via mounted neo4j.conf (not env vars) because
+    # NEO4J_* env var processing silently ignores advertised_address settings
+    # in both 4.4 and 5.x on dual-stack Docker hosts — the JVM always reports
+    # the dual-stack socket address (::7687) in the routing table regardless.
+    # Mounting neo4j.conf writes settings directly and is guaranteed to apply.
     image: docker.io/library/neo4j:5
     hostname: graph-db
-    # extra_hosts writes directly to /etc/hosts inside the Neo4j container.
-    # This guarantees InetAddress.getLocalHost() returns 172.28.1.3 (IPv4)
-    # when Neo4j looks up its own hostname to populate the bolt routing table.
-    # Without this, Docker DNS may return :: (IPv6) for "graph-db" even on an
-    # IPv4-only network, causing the routing table to advertise ::7687 and
-    # BloodHound's Go driver to fail with "too many colons in address".
-    extra_hosts:
-      - "graph-db:172.28.1.3"
     environment:
+      # NEO4J_AUTH is processed by a separate entrypoint path (auth.ini),
+      # independent of neo4j.conf env var processing — safe to keep here.
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
-      NEO4J_server_jvm_additional: "-Djava.net.preferIPv4Stack=true"
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7474:7474"
     volumes:
       - neo4j-data:/data
+      - ./neo4j.conf:/var/lib/neo4j/conf/neo4j.conf
     networks:
       bhce:
         ipv4_address: 172.28.1.3
