@@ -1,55 +1,23 @@
 # ============================================================================
 # BloodHound Community Edition — Docker Compose stack
 # Usage: docker compose up -d
-# Web UI: http://localhost:8888  (default creds: admin / [generated on first run])
+# Web UI: http://localhost:8888  (default creds: admin / [see logs])
 # ============================================================================
 #
-# HOST PORT MAP (all bound to 127.0.0.1 — never exposed on 0.0.0.0):
-#   127.0.0.1:55432  → app-db      (Postgres) — debug only; BHCE connects via 172.28.1.2:5432
-#   127.0.0.1:7687   → graph-db    (Neo4j bolt) — operator bolt client access
-#   127.0.0.1:7474   → graph-db    (Neo4j browser UI)
-#   127.0.0.1:8888   → bloodhound  (BloodHound CE web UI)
+# HOST PORT MAP (all bound to 127.0.0.1):
+#   127.0.0.1:55432  → app-db   (Postgres) — debug only
+#   127.0.0.1:7687   → graph-db (Neo4j bolt)
+#   127.0.0.1:7474   → graph-db (Neo4j browser UI)
+#   127.0.0.1:8888   → bloodhound (BloodHound CE web UI)
 #
-# Rationale for non-standard host ports:
-#   - 55432 (not 5432): Kali ships with Postgres enabled by default on 5432.
-#     Publishing 5432 causes `bind: address already in use` on fresh installs.
-#     55432 is in the ephemeral range yet above all common service ports.
-#   - 8888 (not 8080): 8080 is heavily contested on pentest boxes (Burp,
-#     dev servers, corp proxies). 8888 rarely collides.
-#   Container-to-container traffic is unaffected — it flows over the bhce
-#   bridge using the static IPv4 addresses below.
-#
-# ── Subnet-conflict note ───────────────────────────────────────────────────
-# The 172.28.1.0/24 subnet below can collide with:
-#   (a) Existing Docker networks on the host (docker network ls)
-#   (b) VPN routes common on pentest boxes — OpenVPN/WireGuard engagements
-#       frequently use 172.16.0.0/12 space for client tunnels.
-# If a collision occurs, Docker will fail to create the network OR the
-# bridge will black-hole traffic intended for the VPN peer.
-# Check before `docker compose up -d`:
-#   docker network ls --format '{{.Name}}: {{.Driver}}'
-#   ip route | grep 172.28
-# If either lists a conflicting entry, pick a free /24 (e.g. 10.77.7.0/24
-# or 192.168.77.0/24) and update BOTH:
-#   - networks.bhce.ipam.config[0].subnet + .gateway below
-#   - Every service's networks.bhce.ipv4_address
-#   - tools/bloodhound-ce/bloodhound.config.json (postgres host + bolt URL)
-# phase0_setup.sh runs an automated check for this subnet before startup.
-
-networks:
-  # Named bridge network with an explicit IPv4-only IPAM block.
-  # enable_ipv6: false stops Docker assigning an IPv6 subnet so the embedded
-  # DNS resolver never returns an IPv6 address for service hostnames.
-  # Static IPs are assigned so resolution is deterministic regardless of
-  # start order.
-  bhce:
-    driver: bridge
-    enable_ipv6: false
-    ipam:
-      driver: default
-      config:
-        - subnet: 172.28.1.0/24
-          gateway: 172.28.1.1
+# NETWORK: intentionally uses the default Docker bridge, not a custom named
+# network. The custom bhce network with static IPs caused Neo4j's JVM to
+# bind dual-stack sockets and report ::7687 in the bolt routing table on
+# hosts with IPv6 enabled at the kernel level, making the Go bolt driver fail
+# with "too many colons in address". The default bridge is IPv4-only by
+# default and matches the approach in SpecterOps' official docker-compose.
+# Container-to-container traffic uses Docker service name DNS (app-db,
+# graph-db) — see bloodhound.config.json for connection strings.
 
 services:
   app-db:
@@ -59,66 +27,44 @@ services:
       POSTGRES_PASSWORD: bloodhoundcommunityedition
       POSTGRES_DB: bloodhound
     ports:
+      # 55432 not 5432: Kali ships with Postgres on 5432 by default.
       - "127.0.0.1:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    networks:
-      bhce:
-        ipv4_address: 172.28.1.2
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bloodhound"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 60s
+      start_period: 30s
     restart: unless-stopped
 
   graph-db:
-    # Neo4j 5. Config is supplied via mounted neo4j.conf (not env vars) because
-    # NEO4J_* env var processing silently ignores advertised_address settings
-    # in both 4.4 and 5.x on dual-stack Docker hosts — the JVM always reports
-    # the dual-stack socket address (::7687) in the routing table regardless.
-    # Mounting neo4j.conf writes settings directly and is guaranteed to apply.
-    image: docker.io/library/neo4j:5
-    hostname: graph-db
+    image: docker.io/library/neo4j:4.4
     environment:
-      # NEO4J_AUTH is processed by a separate entrypoint path (auth.ini),
-      # independent of neo4j.conf env var processing — safe to keep here.
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
+      NEO4J_dbms_allow__upgrade: "true"
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7474:7474"
     volumes:
       - neo4j-data:/data
-      - ./neo4j.conf:/var/lib/neo4j/conf/neo4j.conf
-    networks:
-      bhce:
-        ipv4_address: 172.28.1.3
     healthcheck:
-      test: ["CMD", "bash", "-c", "wget -q -O /dev/null http://localhost:7474 && (echo > /dev/tcp/localhost/7687) 2>/dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -O /dev/null -q http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 120s
+      retries: 10
+      start_period: 60s
     restart: unless-stopped
 
   bloodhound:
     image: specterops/bloodhound:latest
     environment:
       - bloodhound_config_path=/bloodhound.config.json
-    # Force graph-db and app-db to resolve to IPv4 inside the BloodHound
-    # container — belt-and-braces against Docker DNS returning IPv6 addresses.
-    extra_hosts:
-      - "graph-db:172.28.1.3"
-      - "app-db:172.28.1.2"
     volumes:
       - ./bloodhound.config.json:/bloodhound.config.json:ro
     ports:
-      # SYNC: phase0_setup.sh polls localhost:8888 — must match this port
       - "127.0.0.1:8888:8080"
-    networks:
-      bhce:
-        ipv4_address: 172.28.1.4
     depends_on:
       app-db:
         condition: service_healthy
