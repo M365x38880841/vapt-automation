@@ -11,13 +11,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../lib/common.sh"
 
-# ERR trap: print the exact line and command that caused set -e to fire.
-# Remove this trap once the exit-code-1 issue is resolved.
-trap 'rc=$?
-echo -e "\033[0;31m[FATAL] phase1 aborted — line ${LINENO}, exit ${rc}\033[0m" >&2
-echo -e "\033[0;31m        Command: ${BASH_COMMAND}\033[0m" >&2
-exit ${rc}' ERR
-
 log PHASE "Phase 1 — Reconnaissance & Discovery"
 check_testing_window
 detect_system_resources

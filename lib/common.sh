@@ -236,7 +236,12 @@ bg_run() {
     # Make sure the log file's parent directory exists before the child writes to it.
     mkdir -p "$(dirname "${logfile}")" 2>/dev/null || true
     log_cmd "$*"
-    nohup "$@" >> "${logfile}" 2>&1 &
+    # Redirect stdin from /dev/null explicitly. nohup only does this automatically
+    # when stdin IS a terminal; when invoked from the orchestrator's subprocess.run
+    # stdin is a pipe, not a TTY, so nohup leaves it open. The orphaned background
+    # job then holds a reference to the shell's stdin, preventing the terminal from
+    # returning control cleanly after the phase script exits ("frozen terminal").
+    nohup "$@" >> "${logfile}" 2>&1 < /dev/null &
     local pid=$!
     # `disown` fails (exit 1) if the child already exited before we got here —
     # e.g. nmap aborted instantly on a bad flag.  Under `set -e` that failure
