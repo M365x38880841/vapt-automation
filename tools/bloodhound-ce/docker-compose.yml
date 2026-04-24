@@ -9,15 +9,6 @@
 #   127.0.0.1:7687   → graph-db (Neo4j bolt)
 #   127.0.0.1:7474   → graph-db (Neo4j browser UI)
 #   127.0.0.1:8888   → bloodhound (BloodHound CE web UI)
-#
-# NETWORK: intentionally uses the default Docker bridge, not a custom named
-# network. The custom bhce network with static IPs caused Neo4j's JVM to
-# bind dual-stack sockets and report ::7687 in the bolt routing table on
-# hosts with IPv6 enabled at the kernel level, making the Go bolt driver fail
-# with "too many colons in address". The default bridge is IPv4-only by
-# default and matches the approach in SpecterOps' official docker-compose.
-# Container-to-container traffic uses Docker service name DNS (app-db,
-# graph-db) — see bloodhound.config.json for connection strings.
 
 services:
   app-db:
@@ -27,7 +18,6 @@ services:
       POSTGRES_PASSWORD: bloodhoundcommunityedition
       POSTGRES_DB: bloodhound
     ports:
-      # 55432 not 5432: Kali ships with Postgres on 5432 by default.
       - "127.0.0.1:55432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
@@ -44,6 +34,22 @@ services:
     environment:
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
       NEO4J_dbms_allow__upgrade: "true"
+    # Disable IPv6 inside the Neo4j container at the kernel level.
+    # Root cause of "::7687: too many colons in address":
+    #   The attack machine has IPv6 enabled in the kernel. Every Docker bridge
+    #   (user-defined or default) receives an IPv6 link-local address from the
+    #   host kernel regardless of Docker's enable_ipv6 or ipv6:false settings.
+    #   Neo4j's JVM sees this IPv6 interface and binds a dual-stack socket on
+    #   :::7687. When Neo4j builds its bolt routing table it reports the
+    #   unspecified IPv6 address as "::7687" (no brackets). BloodHound's Go
+    #   bolt driver passes that string to net.Dial which rejects it.
+    #   sysctls disables IPv6 inside this container's network namespace only —
+    #   the host and all other containers are unaffected. With IPv6 gone, the
+    #   JVM binds IPv4-only (0.0.0.0:7687) and the routing table returns a
+    #   valid IPv4 address/hostname.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7474:7474"
