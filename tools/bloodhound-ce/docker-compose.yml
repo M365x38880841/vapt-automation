@@ -80,49 +80,20 @@ services:
     # Upgrade path: stop the stack, wipe the neo4j-data volume (see phase0),
     # switch the tag, and restart. Credentials and config stay the same.
     image: docker.io/library/neo4j:4.4
+    # Explicit hostname so Neo4j always advertises "graph-db" in its routing
+    # table response — regardless of the container's short ID hostname.
+    # BloodHound's Go bolt driver receives "graph-db:7687" from the routing
+    # table, resolves it via Docker's embedded DNS (127.0.0.11), and gets the
+    # static IPv4 address 172.28.1.3 — no IPv6 involvement, no colon error.
+    # This is the same approach used in SpecterOps' official docker-compose.
+    # All NEO4J_ env vars for advertised_address have been removed because
+    # Neo4j 4.4 ignores them in practice (the log still shows the container
+    # hostname despite setting them) — hostname: is the reliable mechanism.
+    hostname: graph-db
     environment:
       NEO4J_AUTH: neo4j/bloodhoundcommunityedition
       NEO4J_dbms_allow__upgrade: "true"
-      # Neo4j 4.4 JVM: force IPv4 stack so the bolt connector binds on
-      # IPv4 rather than [::]:7687 (IPv6). Required but NOT sufficient on its
-      # own — Docker's embedded DNS can still feed IPv6-mapped addresses into
-      # Neo4j's routing table regardless of the JVM flag.
       NEO4J_dbms_jvm_additional: "-Djava.net.preferIPv4Stack=true"
-
-      # ── Listen address: explicit IPv4, NOT wildcard ─────────────────────
-      # Previously set to "0.0.0.0:7687". On some Docker hosts the JVM still
-      # grabs an IPv6 socket via ::/0 dual-stack binding even with
-      # preferIPv4Stack=true, which in turn causes Neo4j to report its routing
-      # entry as the IPv6-mapped form. Binding to the container's static IPv4
-      # eliminates any dual-stack ambiguity.
-      NEO4J_dbms_connector_bolt_listen__address: "172.28.1.3:7687"
-
-      # ── Bolt-connector-specific advertised address ──────────────────────
-      # MUST be the explicit static IPv4 — not the hostname "graph-db".
-      # Docker's internal DNS can return an IPv6-mapped address for container
-      # hostnames even on enable_ipv6:false networks (e.g. ::ffff:172.28.1.3).
-      # BloodHound's Go bolt client receives this address from Neo4j's routing
-      # table handshake and constructs "bolt://::ffff:172.28.1.3:7687" which
-      # Go's net.Dial rejects with "too many colons in address".
-      # Using the static IPv4 ensures the advertised address is unambiguous.
-      NEO4J_dbms_connector_bolt_advertised__address: "172.28.1.3:7687"
-
-      # ── Default advertised address (the real root-cause fix) ────────────
-      # Neo4j 4.4 has TWO advertised-address settings:
-      #   1. dbms.connector.bolt.advertised_address  (bolt-only — set above)
-      #   2. dbms.default_advertised_address         (BASE for all connectors
-      #                                               AND the routing table)
-      # Setting (1) alone is not enough: when Neo4j assembles the cluster
-      # routing table it falls back to dbms.default_advertised_address, which
-      # defaults to the container hostname. Docker DNS may resolve that to an
-      # IPv6-mapped IPv4 form (::ffff:172.28.1.3) and push that into the
-      # routing response. Go's bolt driver then builds an unbracketed
-      # "bolt://::ffff:172.28.1.3:7687" URL and fails with
-      # "too many colons in address".
-      # Env-var naming for Neo4j 4.4: dots → single underscore,
-      # underscores inside the key → double underscore, prepend NEO4J_.
-      # So dbms.default_advertised_address → NEO4J_dbms_default__advertised__address
-      NEO4J_dbms_default__advertised__address: "172.28.1.3"
     ports:
       - "127.0.0.1:7687:7687"
       - "127.0.0.1:7474:7474"
@@ -141,10 +112,7 @@ services:
       # (neither are installed in the default neo4j image). We invoke bash
       # explicitly because CMD-SHELL uses /bin/sh → dash on Debian, and dash
       # does NOT implement the /dev/tcp pseudo-device.
-      # Bolt listens on 172.28.1.3:7687 (explicit static IP, not 0.0.0.0) so the
-      # TCP probe must use 172.28.1.3, not localhost — they are different addresses
-      # inside the container and localhost:7687 will always fail to connect.
-      test: ["CMD", "bash", "-c", "wget -q -O /dev/null http://localhost:7474 && (echo > /dev/tcp/172.28.1.3/7687) 2>/dev/null || exit 1"]
+      test: ["CMD", "bash", "-c", "wget -q -O /dev/null http://localhost:7474 && (echo > /dev/tcp/localhost/7687) 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
