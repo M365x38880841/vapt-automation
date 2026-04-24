@@ -377,6 +377,21 @@ notify_complete() {
     fi
 }
 
+# ─── CREDENTIAL NORMALISATION ─────────────────────────────────────────────────
+# Users sometimes enter DOMAIN_USER as a UPN (jamiush@ha-shem.com) instead of
+# just the sAMAccountName (jamiush). Every tool that takes both -u and -d builds
+# the UPN internally, so passing the full UPN produces jamiush@ha-shem.com@ha-shem.com
+# which every authenticator rejects. Strip the @domain suffix if present.
+# Call after require_var "DOMAIN_USER" in every phase that uses credentials.
+normalise_domain_user() {
+    if [[ "${DOMAIN_USER:-}" == *@* ]]; then
+        local _raw="${DOMAIN_USER}"
+        DOMAIN_USER="${DOMAIN_USER%%@*}"
+        export DOMAIN_USER
+        log INFO "DOMAIN_USER normalised: '${_raw}' → '${DOMAIN_USER}' (use DOMAIN_NAME for the domain part)"
+    fi
+}
+
 # ─── PRIMARY DC HELPER ────────────────────────────────────────────────────────
 # DC_IP is a space-separated list (e.g. "10.10.1.10 10.10.1.11").
 # Most tools accept only a single -dc-ip / -ns / ldap:// target — use the

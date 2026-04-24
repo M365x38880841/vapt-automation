@@ -41,6 +41,7 @@ for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon passwor
 done
 if [[ "${_needs_domain_creds}" == "true" ]]; then
     require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+    normalise_domain_user
 fi
 unset _cred_step _needs_domain_creds
 
@@ -463,18 +464,30 @@ fi
 if ! _step_is_skipped "null_session"; then
     log INFO "Checking for SMB null session on all DCs (${DC_IP})..."
     : > "${OUT_AD}/nullsession_check.txt"
+    _null_vulnerable=false
     for _dc in ${DC_IP}; do
         log_cmd "${CME_BIN} smb ${_dc} --null-session"
+        _dc_out=$("${CME_BIN}" smb "${_dc}" --null-session 2>&1 || true)
         echo "### DC: ${_dc}" >> "${OUT_AD}/nullsession_check.txt"
-        "${CME_BIN}" smb "${_dc}" --null-session \
-            2>&1 >> "${OUT_AD}/nullsession_check.txt" || true
+        echo "${_dc_out}"    >> "${OUT_AD}/nullsession_check.txt"
+
+        # A blocked null session produces STATUS_ACCESS_DENIED or STATUS_LOGON_FAILURE.
+        # A successful null session produces a [+] line with host info and NO error code.
+        # Check per-DC so one blocked DC cannot hide a vulnerable one.
+        if echo "${_dc_out}" | grep -qE 'STATUS_ACCESS_DENIED|STATUS_LOGON_FAILURE'; then
+            log OK "Null session blocked on ${_dc}"
+        elif echo "${_dc_out}" | grep -qE '^\s*(\[|\*|SMB).*\+'; then
+            log WARN "FINDING: Null session ALLOWED on ${_dc} — unauthenticated SMB access possible"
+            _null_vulnerable=true
+        else
+            log WARN "Null session result inconclusive on ${_dc} (connection issue?) — review: ${OUT_AD}/nullsession_check.txt"
+        fi
     done
-    unset _dc
-    if grep -q 'STATUS_ACCESS_DENIED\|STATUS_LOGON_FAILURE' "${OUT_AD}/nullsession_check.txt" 2>/dev/null; then
-        log OK "Null session blocked on all checked DCs"
-    else
-        log WARN "Null session may be accessible on one or more DCs — review: ${OUT_AD}/nullsession_check.txt"
+    unset _dc _dc_out
+    if [[ "${_null_vulnerable}" == "true" ]]; then
+        log WARN "One or more DCs allow null sessions — add to findings, check legacy auth settings"
     fi
+    unset _null_vulnerable
 fi
 
 # ─── STEP 1.7 — BLOODHOUND DATA COLLECTION (background) ──────────────────────

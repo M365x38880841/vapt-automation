@@ -40,6 +40,7 @@ done
 
 if [[ "${_needs_domain_creds}" == "true" ]]; then
     require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+    normalise_domain_user
 fi
 if [[ "${_needs_cloud_vars}" == "true" ]]; then
     require_var "AZURE_TENANT_ID"; require_var "AZURE_SUBSCRIPTION_IDS"
