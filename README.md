@@ -59,7 +59,8 @@ Phase 0 (`phases/phase0_setup.sh`) installs and verifies everything automaticall
 | responder | apt | LLMNR/NBT-NS poisoning, NTLMv2 capture |
 | hashcat | apt | Password cracking (NTLMv2, TGS, AS-REP) |
 | ldap-utils | apt | LDAP queries (ldapsearch) |
-| docker-ce + compose plugin | Docker CE repo | BloodHound CE, OWASP ZAP |
+| docker-ce + compose plugin | Docker CE repo | Container runtime for OWASP ZAP |
+| bloodhound-cli | GitHub releases (auto-downloaded) | BloodHound CE lifecycle management |
 | azure-cli | apt / Microsoft | Azure / Entra ID enumeration |
 | bloodhound-python | pipx | BloodHound data collection |
 | roadrecon | pipx | Entra ID / ROADtools gather |
@@ -186,8 +187,7 @@ Copy `config.env.example` to `config.env` and set every value before running Pha
 | Variable | Example | Description |
 |----------|---------|-------------|
 | `DOMAIN_NAME` | `hashem.local` | FQDN of the target domain |
-| `DC_IP` | `10.10.1.10` | Primary domain controller IP |
-| `ADDITIONAL_DC_IPS` | `10.10.1.11` | Optional additional DCs (space-separated) |
+| `DC_IP` | `10.10.1.10 10.10.1.11` | Space-separated list of DC IPs. The first IP is the primary DC used for single-target tool flags (`-dc-ip`, `-ns`, `ldap://`). All IPs are enumerated for reachability, null-session, and LDAP banner checks in Phase 1. |
 
 ### Azure / Entra ID
 
@@ -253,7 +253,7 @@ Credentials prompted per phase:
 
 | Secret | Phases | Notes |
 |--------|--------|-------|
-| `DOMAIN_USER` | 1, 2, 3, 4 | Domain username only — not an email address |
+| `DOMAIN_USER` | 1, 2, 3, 4 | Domain username (`sAMAccountName`). If a UPN (`user@domain.com`) is entered it is automatically stripped to just the username — tools that take `-u` and `-d` separately would otherwise double-append the domain. |
 | `DOMAIN_PASS` | 1, 2, 3, 4 | Hidden input via `getpass` |
 | `AZURE_USER` | 1 (optional) | Leave blank to use device code flow |
 | `AZURE_PASS` | 1 (optional) | Leave blank to use device code flow |
@@ -344,26 +344,24 @@ All output is written under `OUTPUT_BASE_DIR` (default: `~/vapt/`). Phase 0 crea
 
 ## BloodHound CE
 
-BloodHound Community Edition runs as a Docker Compose stack (started automatically by Phase 0).
-
-> **Compose command:** use `docker compose` (v2 plugin) if available, otherwise `docker-compose` (v1). Phase 0 detects which is present. For manual commands below, substitute accordingly.
+BloodHound Community Edition is managed by **`bloodhound-cli`**, SpecterOps' official management tool. Phase 0 locates or downloads `bloodhound-cli` automatically and uses it to install and start the stack.
 
 ```bash
 # Check stack status
-docker compose -f tools/bloodhound-ce/docker-compose.yml ps
+bloodhound-cli status
 
-# Get first-run admin password (printed once on initial startup)
-docker compose -f tools/bloodhound-ce/docker-compose.yml logs bloodhound \
-    2>&1 | grep -i 'initial password\|password'
+# Get first-run admin password
+bloodhound-cli password
+# or: bloodhound-cli logs | grep -i 'initial password'
+
+# Start the stack
+bloodhound-cli start
 
 # Stop the stack when not in use
-docker compose -f tools/bloodhound-ce/docker-compose.yml down
-
-# Restart the stack
-docker compose -f tools/bloodhound-ce/docker-compose.yml up -d
+bloodhound-cli stop
 ```
 
-Access the UI at **http://localhost:8080**. Import the BloodHound ZIP from `~/vapt/phase1/ad/bloodhound/` after Phase 1 completes.
+Access the UI at **http://localhost:8080**. Import the BloodHound ZIP from `~/vapt/phase1/ad/bloodhound/` via Administration → File Ingest after Phase 1 completes.
 
 ---
 

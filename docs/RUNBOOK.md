@@ -40,7 +40,7 @@ Complete every item before running Phase 0. The framework enforces the RoE check
 - [ ] Attack machine on internal network with Layer 2 access to at least one target subnet
 - [ ] Domain user account provisioned (read-only; must NOT be a service account or shared account)
 - [ ] Azure Reader role assigned to the testing account on all in-scope subscriptions
-- [ ] DC IP confirmed reachable: `ping <DC_IP>`
+- [ ] All DCs in `DC_IP` confirmed reachable: `for ip in <DC_IP>; do ping -c 2 "$ip"; done`
 - [ ] `config.env` filled in from `config.env.example` (all variables, no placeholders remaining)
 - [ ] `WEB_TARGETS` set to in-scope web application base URLs (or explicitly left empty)
 
@@ -93,9 +93,9 @@ python3 orchestrator.py --phase 0
 3. All required tools verified; missing tools auto-installed
 4. rockyou.txt decompressed or downloaded if missing
 5. Corporate password pattern wordlist generated
-6. BloodHound CE Docker stack started (Postgres + Neo4j + BloodHound UI)
+6. `bloodhound-cli` located or downloaded from GitHub releases; BloodHound CE installed and started via `bloodhound-cli start`
 7. Azure CLI login checked; device code flow initiated if not logged in
-8. DC reachability checked
+8. All DCs in `DC_IP` checked for reachability
 9. Scope JSON written to `~/vapt/phase0/scope.json`
 
 **Operator actions during Phase 0:**
@@ -103,8 +103,8 @@ python3 orchestrator.py --phase 0
 - When Azure device code appears: open the browser, authenticate, return to terminal
 - After Phase 0: retrieve BloodHound CE first-run password:
   ```bash
-  docker compose -f tools/bloodhound-ce/docker-compose.yml logs bloodhound \
-      2>&1 | grep -i 'initial password\|password'
+  bloodhound-cli password
+  # or: bloodhound-cli logs | grep -i 'initial password'
   ```
 - Log into BloodHound CE at http://localhost:8080 and confirm it loads
 
@@ -155,7 +155,7 @@ python3 orchestrator.py --phase 1 --list-steps
 **After background jobs complete:**
 1. Check merge complete: `ls -lh ~/vapt/phase1/network/fullscan.gnmap`
 2. Check BloodHound ZIP: `ls ~/vapt/phase1/ad/bloodhound/*.zip`
-3. Import BloodHound ZIP into UI at http://localhost:8080
+3. Confirm BloodHound CE is running: `bloodhound-cli status`; import the BloodHound ZIP into the UI at http://localhost:8080 (Administration → File Ingest)
 4. Run key BloodHound queries:
    - Shortest path to Domain Admins
    - All Kerberoastable users
@@ -569,7 +569,7 @@ python3 orchestrator.py --phase 3 --only hashcat
 | Time | Action |
 |------|--------|
 | Start of day | `python3 orchestrator.py --status` — check what completed |
-| +5 min | Start BloodHound CE if not running: `docker compose -f tools/bloodhound-ce/docker-compose.yml up -d` |
+| +5 min | Start BloodHound CE if not running: `bloodhound-cli start` |
 | `TESTING_WINDOW_START` | `python3 orchestrator.py --phase <today>` |
 | +5 min | Background jobs start / resume (Nmap chunks, ScoutSuite, Hashcat, ZAP) |
 | Active hours | BloodHound analysis, Burp testing, manual AD checks, review cracked hashes as they appear |
@@ -677,25 +677,28 @@ Add `export PATH="${HOME}/.local/bin:${PATH}"` to `~/.bashrc` or `~/.zshrc` perm
 
 **Fix:** This is expected if Responder just started. Wait for hashes to accumulate, then re-run Phase 3.
 
-### BloodHound CE: "graph migration error: too many colons in address"
+### BloodHound CE: "too many colons in address" (Neo4j IPv6 bolt error)
 
-**Symptom:** `bloodhound-1` container log shows a graph migration error with "too many colons in address" or similar connectivity failure. Neo4j bolt IS listening (confirmed via `ss -tlnp | grep 7687`).
+**Symptom:** BloodHound container log shows a graph migration error with "too many colons in address". Neo4j bolt IS listening (`ss -tlnp | grep 7687`).
 
-**Root cause:** Neo4j 4.4 advertises its bolt address to clients as part of the routing table handshake. If `NEO4J_dbms_connector_bolt_advertised__address` is set to a hostname (`graph-db`), Docker's internal DNS can resolve that hostname to an IPv6-mapped address (e.g. `::ffff:172.28.1.3`) even on `enable_ipv6: false` networks. BloodHound's Go bolt client receives this address and constructs `bolt://::ffff:172.28.1.3:7687` — Go's `net.Dial` rejects this with "too many colons in address" because the IPv6 host is not wrapped in brackets.
+**Root cause:** The host kernel has IPv6 enabled. Neo4j's JVM binds a dual-stack socket on `:::7687` and reports the unspecified IPv6 address (`::7687`) in its bolt routing table. BloodHound's Go bolt client rejects this address format.
 
-**Fix:** The `docker-compose.yml` already sets the advertised address to the explicit static IPv4 (`172.28.1.3:7687`). If you see this error it means the container was created from an older config and needs to be **fully recreated** (not just restarted):
+**Fix (automated):** `tools/bloodhound-ce/docker-compose.yml` now includes `sysctls` to disable IPv6 inside the Neo4j container's network namespace. If BloodHound CE was started via `bloodhound-cli` (Phase 0 default), this compose file is not used directly — `bloodhound-cli` manages its own stack. Restart via `bloodhound-cli`:
 
 ```bash
-# Full teardown and recreate — this picks up the fixed advertised address
-docker-compose -f tools/bloodhound-ce/docker-compose.yml down
-docker-compose -f tools/bloodhound-ce/docker-compose.yml up -d
+bloodhound-cli stop
+bloodhound-cli start
 
-# Verify Neo4j is advertising the correct IPv4 address
-docker-compose -f tools/bloodhound-ce/docker-compose.yml logs graph-db 2>&1 \
-    | grep -i 'bolt\|advertis'
+# Check logs if still failing
+bloodhound-cli logs
 ```
 
-> **Important:** `docker restart` or `docker compose restart` does NOT re-apply environment variable changes — only `down` + `up -d` recreates the container with the new config.
+If you are running the manual docker-compose stack from `tools/bloodhound-ce/`:
+```bash
+docker compose -f tools/bloodhound-ce/docker-compose.yml down
+docker compose -f tools/bloodhound-ce/docker-compose.yml up -d
+# The sysctls in the updated compose file disable IPv6 in the Neo4j container
+```
 
 ### BloodHound CE cannot be reached at http://localhost:8080
 
@@ -703,18 +706,18 @@ docker-compose -f tools/bloodhound-ce/docker-compose.yml logs graph-db 2>&1 \
 
 **Fix:**
 ```bash
-# Check if stack is running
-docker compose -f tools/bloodhound-ce/docker-compose.yml ps
+# Check stack status
+bloodhound-cli status
 
 # Check for port conflict
 ss -tlnp | grep 8080
 
-# Restart stack
-docker compose -f tools/bloodhound-ce/docker-compose.yml down
-docker compose -f tools/bloodhound-ce/docker-compose.yml up -d
+# Restart
+bloodhound-cli stop
+bloodhound-cli start
 
-# Follow startup logs
-docker compose -f tools/bloodhound-ce/docker-compose.yml logs -f bloodhound
+# Follow logs
+bloodhound-cli logs
 ```
 
 ### Testing window blocked outside business hours
@@ -740,7 +743,7 @@ Use this procedure if you need to halt all testing immediately (incident respons
 
 3. **Stop Docker-based tools:**
    ```bash
-   docker compose -f tools/bloodhound-ce/docker-compose.yml down 2>/dev/null
+   bloodhound-cli stop 2>/dev/null
    docker stop $(docker ps -q) 2>/dev/null
    ```
 
@@ -761,9 +764,10 @@ Use this procedure if you need to halt all testing immediately (incident respons
 After the final report has been delivered and accepted:
 
 ```bash
-# 1. Stop BloodHound CE
-docker compose -f tools/bloodhound-ce/docker-compose.yml down -v
-# The -v flag removes the Postgres and Neo4j volumes (deletes all collected AD data)
+# 1. Stop BloodHound CE and remove its data
+bloodhound-cli stop
+# To also wipe collected AD data (volumes), use bloodhound-cli uninstall or remove volumes manually:
+# docker volume ls | grep bloodhound | awk '{print $2}' | xargs docker volume rm
 
 # 2. Remove cracked credentials and hashes
 shred -uz ~/vapt/phase3/ad/cracked_*.txt

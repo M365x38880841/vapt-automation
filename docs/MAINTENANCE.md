@@ -32,6 +32,7 @@ Perform these tasks before each engagement and at minimum once per quarter:
 | Check for `nxc` / `crackmapexec` updates | ✓ | ✓ |
 | Verify `config.env` has no placeholder values; `SCAN_EXCLUDE_RANGES` reflects current infra | ✓ | |
 | Validate `NMAP_DISCOVERY_PORTS` is still appropriate for the target environment | ✓ | |
+| Check for `bloodhound-cli` updates; upgrade if new version available | ✓ | ✓ |
 | Review new BloodHound CE release notes | | ✓ |
 | Review new OWASP ZAP release notes | | ✓ |
 | Check `requirements.txt` version pins still valid | | ✓ |
@@ -150,28 +151,33 @@ sudo apt-get upgrade docker-ce docker-ce-cli docker-compose-plugin
 docker compose version
 ```
 
-After a Docker upgrade, restart the BloodHound CE stack to ensure it runs against the new version:
+After a Docker upgrade, restart BloodHound CE to ensure it runs against the updated daemon:
 
 ```bash
-docker compose -f tools/bloodhound-ce/docker-compose.yml down
-docker compose -f tools/bloodhound-ce/docker-compose.yml pull
-docker compose -f tools/bloodhound-ce/docker-compose.yml up -d
+bloodhound-cli stop
+bloodhound-cli start
 ```
 
 ### Updating BloodHound CE
 
-BloodHound CE updates are handled by updating the Docker image:
+BloodHound CE is now managed via `bloodhound-cli`. Updates are handled by upgrading `bloodhound-cli` itself and then letting it pull the new images:
 
 ```bash
-# Pull the latest image
-docker pull specterops/bloodhound:latest
+# Check current version
+bloodhound-cli version
 
-# Restart the stack
-docker compose -f tools/bloodhound-ce/docker-compose.yml down
-docker compose -f tools/bloodhound-ce/docker-compose.yml up -d
+# Download the latest bloodhound-cli binary
+_arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSL "https://github.com/SpecterOps/bloodhound-cli/releases/latest/download/bloodhound-cli_linux_${_arch}.tar.gz" \
+    | tar -xz -C ~/.local/bin
+bloodhound-cli version   # confirm new version
+
+# Restart to pick up any new BloodHound CE container images
+bloodhound-cli stop
+bloodhound-cli start
 ```
 
-> **Note:** Major BloodHound CE versions may require database migrations. Read the release notes at https://github.com/SpecterOps/BloodHound/releases before pulling a new major version. The `-v` flag on `docker compose down` removes volumes (including the database) — do not use it unless you intend to wipe all collected data.
+> **Note:** Major BloodHound CE versions may require database migrations. Read the release notes at https://github.com/SpecterOps/BloodHound/releases before upgrading. If collected data needs to be preserved, export it from the BloodHound UI first.
 
 ### Updating OWASP ZAP
 
@@ -203,8 +209,8 @@ Pass the step key as the third argument to `skip_if_exists`. This is what wires 
 CONSTRAINED_OUT="${AD_CHECKS}/constrained_delegation.txt"
 if ! skip_if_exists "${CONSTRAINED_OUT}" "Constrained delegation check" "constrained_delegation"; then
     log INFO "Checking for constrained delegation (msDS-AllowedToDelegateTo)..."
-    log_cmd "ldapsearch -H ldap://${DC_IP} ... (constrained delegation filter)"
-    ldapsearch -H "ldap://${DC_IP}" \
+    log_cmd "ldapsearch -H ldap://${PRIMARY_DC} ... (constrained delegation filter)"
+    ldapsearch -H "ldap://${PRIMARY_DC}" \
         -D "${DOMAIN_USER}@${DOMAIN_NAME}" \
         -w "${DOMAIN_PASS}" \
         -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
@@ -483,9 +489,13 @@ docker info &>/dev/null && echo "  OK: Docker daemon" || echo "  FAIL: Docker da
 docker compose version && echo "  OK: docker compose plugin" || echo "  FAIL: compose plugin missing"
 
 echo ""
+echo "=== bloodhound-cli ==="
+command -v bloodhound-cli && bloodhound-cli version || echo "  MISSING — Phase 0 will auto-download from GitHub releases"
+
+echo ""
 echo "=== BloodHound CE stack ==="
-docker compose -f tools/bloodhound-ce/docker-compose.yml ps 2>/dev/null | grep -qE 'running|Up' \
-    && echo "  OK: BloodHound CE running" || echo "  NOT RUNNING — start with: docker compose -f tools/bloodhound-ce/docker-compose.yml up -d"
+bloodhound-cli status 2>/dev/null | grep -qiE 'running|healthy|started' \
+    && echo "  OK: BloodHound CE running" || echo "  NOT RUNNING — start with: bloodhound-cli start"
 
 echo ""
 echo "=== Azure CLI ==="

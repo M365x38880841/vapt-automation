@@ -72,7 +72,7 @@ Every tool install path accounts for Kali-specific behaviours: Docker CE (not do
 │               │  │               │  │              │  │           │
 │ Tool install  │  │ Nmap sweeps   │  │ ScoutSuite   │  │ Responder │
 │ Docker setup  │  │ CME SMB       │  │ Azure checks │  │ Kerberoast│
-│ BloodHound CE │  │ LDAP enum     │  │ AD CS certipy│  │ AS-REP    │
+│ bloodhound-cli│  │ LDAP enum     │  │ AD CS certipy│  │ AS-REP    │
 │ Azure CLI     │  │ BloodHound    │  │ SMB vulns    │  │ Hashcat   │
 │ Wordlists     │  │ ROADrecon     │  │ OWASP ZAP    │  │ NTLM relay│
 │               │  │ Azure inv.    │  │ Nessus API   │  │ PtH sweep │
@@ -89,6 +89,7 @@ Every tool install path accounts for Kali-specific behaviours: Docker CE (not do
 │  log()              skip_if_exists()   notify_complete()           │
 │  require_tool()     require_var()      cleanup_on_exit()           │
 │  check_testing_window()                phase_dir()                 │
+│  set_primary_dc()   normalise_domain_user()                        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -198,7 +199,11 @@ Every background job PID is also written to `${OUTPUT_BASE_DIR}/.bg_jobs` (forma
 
 **Limitation:** `BG_JOB_PIDS` is a shell array local to the running phase script. It does not persist across phase invocations. `orchestrator.py --status` addresses this by reading `.bg_jobs` on disk (process state) and `engagement_log.md` (phase start/end markers) rather than relying on in-memory arrays.
 
+**Stdin isolation in `bg_run()`:** Background jobs are launched with `nohup "$@" >> logfile 2>&1 < /dev/null`. The explicit `< /dev/null` is required because when the orchestrator invokes phase scripts via `subprocess.run()`, stdin is a pipe (not a TTY). Without the redirect, `nohup` leaves the orphaned background process holding a reference to the shell's stdin pipe, preventing the terminal from returning control cleanly after the phase script exits ("frozen terminal" symptom).
+
 **Sudo-wrapped processes (Responder):** Responder runs under `sudo timeout`, which creates a process tree: shell → sudo → timeout → responder. `cleanup_on_exit()` kills the entire process group (`kill -- -<pgid>`) rather than just the top-level PID to ensure the responder process itself is killed.
+
+**Multi-DC support helpers (`set_primary_dc`, `normalise_domain_user`):** `DC_IP` is a space-separated list of domain controller IPs. `set_primary_dc()` exports `PRIMARY_DC` (the first IP in the list) for tools that accept a single `-dc-ip` / `-ns` / `ldap://` target; phase scripts iterate over `${DC_IP}` for checks that should cover every DC (reachability, null-session, LDAP banner). `normalise_domain_user()` strips the `@domain` suffix from `DOMAIN_USER` if the operator entered a UPN (`user@domain.com`) instead of a sAMAccountName — tools that take both `-u` and `-d` separately would otherwise double-append the domain component.
 
 ---
 
