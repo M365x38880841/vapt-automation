@@ -459,8 +459,8 @@ if ! _step_is_skipped "null_session"; then
     : > "${OUT_AD}/nullsession_check.txt"
     _null_vulnerable=false
     for _dc in ${DC_IP}; do
-        log_cmd "${CME_BIN} smb ${_dc} --null-session"
-        _dc_out=$("${CME_BIN}" smb "${_dc}" --null-session 2>&1 || true)
+        log_cmd "${CME_BIN} smb ${_dc} -u '' -p ''"
+        _dc_out=$("${CME_BIN}" smb "${_dc}" -u '' -p '' 2>&1 || true)
         echo "### DC: ${_dc}" >> "${OUT_AD}/nullsession_check.txt"
         echo "${_dc_out}"    >> "${OUT_AD}/nullsession_check.txt"
 

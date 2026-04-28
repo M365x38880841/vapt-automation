@@ -376,20 +376,24 @@ if [[ -z "${BH_CLI}" ]]; then
 fi
 unset _candidate
 
+# bloodhound-cli must be invoked from its own directory — it resolves
+# docker-compose.yml and other assets relative to CWD, not to the binary path.
+bh_cli() { (cd "$(dirname "${BH_CLI}")" && "${BH_CLI}" "$@"); }
+
 if [[ -n "${BH_CLI}" ]]; then
-    log OK "bloodhound-cli found: ${BH_CLI} ($(${BH_CLI} version 2>/dev/null || echo 'version unknown'))"
+    log OK "bloodhound-cli found: ${BH_CLI} ($(bh_cli version 2>/dev/null || echo 'version unknown'))"
 
     # ── Check if already running ─────────────────────────────────────────────
-    if "${BH_CLI}" status 2>/dev/null | grep -qiE 'running|healthy|started|Up'; then
+    if bh_cli status 2>/dev/null | grep -qiE 'running|healthy|started|Up'; then
         log OK "BloodHound CE already running → http://localhost:8080"
     else
         if checkpoint "Install and start BloodHound CE via bloodhound-cli?"; then
             log INFO "Running bloodhound-cli install (idempotent)..."
-            "${BH_CLI}" install --no-prompt 2>&1 | tail -10 || \
-            "${BH_CLI}" install 2>&1 | tail -10 || true
+            bh_cli install --no-prompt 2>&1 | tail -10 || \
+            bh_cli install 2>&1 | tail -10 || true
 
             log INFO "Starting BloodHound CE..."
-            "${BH_CLI}" start 2>&1 | tail -5
+            bh_cli start 2>&1 | tail -5
 
             # ── Wait for HTTP endpoint ────────────────────────────────────────
             log INFO "Waiting for BloodHound CE HTTP endpoint (up to 180s)..."
