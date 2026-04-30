@@ -103,7 +103,7 @@ if [[ -d "${OUTPUT_BASE_DIR}/phase2/web/zap" ]]; then
     ZAP_TARGET_COUNT="${ZAP_TARGET_COUNT//[^0-9]/}"
     ZAP_TARGET_COUNT="${ZAP_TARGET_COUNT:-0}"
 fi
-ZAP_HIGH_ALERTS=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.json' \
+ZAP_ALERT_COUNT=$(find "${OUTPUT_BASE_DIR}/phase2/web/zap" -name 'zap_report.json' \
     -exec python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(sum(len(s.get('alerts',[])) for s in d.get('site',[]) if s.get('alerts')))" {} \; 2>/dev/null \
     | awk '{s+=$1} END{print s+0}')
 
@@ -138,7 +138,7 @@ cat > "${SCAFFOLD}" <<SCAFFOLD_EOF
 | AD CS misconfigurations (ESC) | ${ADCS_HITS} | evidence/ad/adcs_find.txt |
 | SMB vulnerability hits | ${SMB_VULN_HITS} | evidence/network/smb_vuln_checks.txt |
 | Web targets DAST-scanned | ${ZAP_TARGET_COUNT} | evidence/web/zap/<target>/zap_report.html |
-| ZAP total alert count | ${ZAP_HIGH_ALERTS} | evidence/web/zap/<target>/zap_report.json |
+| ZAP total alert count | ${ZAP_ALERT_COUNT} | evidence/web/zap/<target>/zap_report.json |
 
 ---
 

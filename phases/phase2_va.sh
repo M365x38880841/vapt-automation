@@ -186,7 +186,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     KERB_COUNT=$(grep -c 'ServicePrincipalName' "${AD_CHECKS}/kerberoastable_accounts.txt" 2>/dev/null || true)
     KERB_COUNT="${KERB_COUNT//[^0-9]/}"
     KERB_COUNT="${KERB_COUNT:-0}"
-    log OK "Kerberoastable accounts found: ${KERB_COUNT}"
+    if [[ "${KERB_COUNT}" -gt 0 ]]; then
+        log OK "Kerberoastable accounts found: ${KERB_COUNT} → ${AD_CHECKS}/kerberoastable_accounts.txt"
+    else
+        log OK "Kerberoastable accounts found: 0 → ${AD_CHECKS}/kerberoastable_accounts.txt"
+    fi
 
     # AS-REP roastable accounts check
     log INFO "Identifying AS-REP Roastable accounts..."
@@ -197,11 +201,11 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         -usersfile "${OUTPUT_BASE_DIR}/phase1/ad/userlist.txt" \
         -dc-ip "${PRIMARY_DC}" \
         -format hashcat \
-        2>&1 > "${AD_CHECKS}/asrep_accounts.txt" || true
+        > "${AD_CHECKS}/asrep_accounts.txt" 2>&1 || true
     ASREP_COUNT=$(grep -c 'krb5asrep' "${AD_CHECKS}/asrep_accounts.txt" 2>/dev/null || true)
     ASREP_COUNT="${ASREP_COUNT//[^0-9]/}"
     ASREP_COUNT="${ASREP_COUNT:-0}"
-    log OK "AS-REP Roastable accounts found: ${ASREP_COUNT}"
+    log OK "AS-REP Roastable accounts found: ${ASREP_COUNT} → ${AD_CHECKS}/asrep_accounts.txt"
 
     # Password policy check
     log INFO "Extracting domain password policy..."
@@ -217,14 +221,16 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     "${CME_BIN}" smb "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --shares \
-        2>&1 > "${AD_CHECKS}/shares.txt" || true
+        > "${AD_CHECKS}/shares.txt" 2>&1 || true
+    log OK "Share enumeration complete → ${AD_CHECKS}/shares.txt"
 
     # Check for accounts with no pre-auth (AS-REP using CME)
     log INFO "Checking admin group members..."
     "${CME_BIN}" smb "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --groups "Domain Admins" \
-        2>&1 > "${AD_CHECKS}/domain_admins.txt" || true
+        > "${AD_CHECKS}/domain_admins.txt" 2>&1 || true
+    log OK "Domain Admins group members → ${AD_CHECKS}/domain_admins.txt"
 
     # Unconstrained delegation check via LDAP
     log INFO "Checking for unconstrained delegation..."
@@ -252,12 +258,12 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
         '(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=65536))' \
         sAMAccountName userAccountControl \
-        2>&1 > "${AD_CHECKS}/pwd_never_expires.txt" || true
+        > "${AD_CHECKS}/pwd_never_expires.txt" 2>&1 || true
     PNE_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/pwd_never_expires.txt" 2>/dev/null || true)
     PNE_COUNT="${PNE_COUNT//[^0-9]/}"
     PNE_COUNT="${PNE_COUNT:-0}"
     if [[ "${PNE_COUNT}" -gt 0 ]]; then
-        log WARN "FINDING: ${PNE_COUNT} account(s) with 'password never expires'"
+        log WARN "FINDING: ${PNE_COUNT} account(s) with 'password never expires' → ${AD_CHECKS}/pwd_never_expires.txt"
     else
         log OK "No password-never-expires accounts found"
     fi
@@ -272,13 +278,16 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         if ! skip_if_exists "${ADCS_OUT}/adcs_find.txt" "AD CS ESC vulnerability scan"; then
             log INFO "Running Certipy AD CS enumeration (ESC1–ESC8 checks)..."
             log_cmd "${CERTIPY_CMD} find -u ${DOMAIN_USER}@${DOMAIN_NAME} -p *** -dc-ip ${PRIMARY_DC} -vulnerable"
-            "${CERTIPY_CMD}" find \
+            # certipy resolves -output relative to CWD, replacing '/' with '_' in
+            # absolute paths. Run from ADCS_OUT with a bare basename so the
+            # .txt/.json files land in the right directory.
+            (cd "${ADCS_OUT}" && "${CERTIPY_CMD}" find \
                 -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
                 -p "${DOMAIN_PASS}" \
                 -dc-ip "${PRIMARY_DC}" \
                 -vulnerable \
-                -output "${ADCS_OUT}/adcs" \
-                2>&1 | tee "${ADCS_OUT}/adcs_find.txt" || true
+                -output adcs \
+                2>&1 | tee adcs_find.txt) || true
             ADCS_VULN=$(grep -c 'ESC[0-9]\|Enabled.*True\|Client Authentication' "${ADCS_OUT}/adcs_find.txt" 2>/dev/null || true)
             ADCS_VULN="${ADCS_VULN//[^0-9]/}"
             ADCS_VULN="${ADCS_VULN:-0}"
@@ -297,14 +306,17 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     if ! skip_if_exists "${SMB_VULN_OUT}" "SMB vulnerability module checks"; then
         log INFO "Running SMB vulnerability checks (ms17-010, nopac, petitpotam)..."
         > "${SMB_VULN_OUT}"
+        # nxc does not support -iL (nmap syntax); read hosts into an array instead.
+        mapfile -t _smb_targets < "${LIVE_HOSTS}"
         for module in ms17-010 nopac petitpotam; do
-            log_cmd "${CME_BIN} smb -iL ${LIVE_HOSTS} -d ${DOMAIN_NAME} -M ${module}"
+            log_cmd "${CME_BIN} smb [${#_smb_targets[@]} hosts] -d ${DOMAIN_NAME} -M ${module}"
             "${CME_BIN}" smb \
-                -iL "${LIVE_HOSTS}" \
+                "${_smb_targets[@]}" \
                 -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
                 -M "${module}" \
                 2>&1 >> "${SMB_VULN_OUT}" || true
         done
+        unset _smb_targets
         VULN_HITS=$(grep -ci 'vulnerable\|VULNERABLE' "${SMB_VULN_OUT}" 2>/dev/null || true)
         VULN_HITS="${VULN_HITS//[^0-9]/}"
         VULN_HITS="${VULN_HITS:-0}"
@@ -348,44 +360,70 @@ else
             full|active) ZAP_SCRIPT="zap-full-scan.py" ;;
             *)            ZAP_SCRIPT="zap-baseline.py"  ;;
         esac
-        log INFO "ZAP scan mode: ${ZAP_SCAN_MODE:-baseline} (script: ${ZAP_SCRIPT})"
+        # Max concurrent ZAP containers — configurable via config.env, default 4.
+        ZAP_CONCURRENCY="${ZAP_CONCURRENCY:-4}"
+        log INFO "ZAP scan mode: ${ZAP_SCAN_MODE:-baseline} (script: ${ZAP_SCRIPT}, concurrency: ${ZAP_CONCURRENCY})"
 
-        for target in ${WEB_TARGETS}; do
-            # Sanitise target URL into a filesystem-safe name for output dirs
-            safe_name="${target//[^a-zA-Z0-9._-]/_}"
-            ZAP_TARGET_OUT="${ZAP_OUT}/${safe_name}"
-            mkdir -p "${ZAP_TARGET_OUT}"
-            ZAP_DONE="${ZAP_TARGET_OUT}/zap_report.html"
-
-            if skip_if_exists "${ZAP_DONE}" "ZAP ${ZAP_SCAN_MODE:-baseline} scan: ${target}" "zap"; then
-                continue
+        # Build list of targets that still need scanning.
+        _zap_pending=()
+        for _zt in ${WEB_TARGETS}; do
+            _zap_safe="${_zt//[^a-zA-Z0-9._-]/_}"
+            if [[ -f "${ZAP_OUT}/${_zap_safe}/zap_report.html" ]]; then
+                log INFO "ZAP: already scanned, skipping: ${_zt}"
+            else
+                _zap_pending+=("${_zt}")
             fi
+        done
 
-            if ! checkpoint "Launch OWASP ZAP ${ZAP_SCAN_MODE:-baseline} scan against ${target}?"; then
-                log INFO "ZAP scan skipped for ${target}"
-                continue
-            fi
-            log INFO "Starting ZAP background scan: ${target}"
-            log_cmd "docker run ... zaproxy ${ZAP_SCRIPT} -t ${target}"
+        if [[ ${#_zap_pending[@]} -eq 0 ]]; then
+            log OK "All ZAP targets already scanned — skipping"
+        elif ! checkpoint "Launch OWASP ZAP ${ZAP_SCAN_MODE:-baseline} scan against ${#_zap_pending[@]} target(s) (${ZAP_CONCURRENCY} concurrent)?"; then
+            log INFO "ZAP scans skipped by operator"
+        else
+            _zap_pids=()
+            for _zt in "${_zap_pending[@]}"; do
+                _zap_safe="${_zt//[^a-zA-Z0-9._-]/_}"
+                _zap_tgt_out="${ZAP_OUT}/${_zap_safe}"
+                mkdir -p "${_zap_tgt_out}"
 
-            # ZAP writes reports relative to /zap/wrk inside the container.
-            # --network host: allows ZAP to reach internal hosts on the LAN.
-            # -I: don't fail the container on warnings (non-zero exits still logged).
-            bg_run "zap_${safe_name}" \
-                "${ZAP_TARGET_OUT}/zap.log" \
+                # Throttle: wait for a free slot before starting the next container.
+                while [[ ${#_zap_pids[@]} -ge ${ZAP_CONCURRENCY} ]]; do
+                    wait -n 2>/dev/null || true
+                    _zap_alive=()
+                    for _zp in "${_zap_pids[@]+"${_zap_pids[@]}"}"; do
+                        kill -0 "${_zp}" 2>/dev/null && _zap_alive+=("${_zp}") || true
+                    done
+                    _zap_pids=("${_zap_alive[@]+"${_zap_alive[@]}"}")
+                done
+
+                log INFO "Starting ZAP scan (slot $((${#_zap_pids[@]}+1))/${ZAP_CONCURRENCY}): ${_zt}"
+                log_cmd "docker run ... zaproxy ${ZAP_SCRIPT} -t ${_zt}"
+                # ZAP writes reports relative to /zap/wrk inside the container.
+                # --network host: allows ZAP to reach internal hosts on the LAN.
+                # -I: don't fail the container on warnings (non-zero exits still logged).
                 docker run --rm \
                     --network host \
-                    -v "${ZAP_TARGET_OUT}:/zap/wrk:rw" \
+                    -v "${_zap_tgt_out}:/zap/wrk:rw" \
                     "${ZAP_IMAGE}" \
                     "${ZAP_SCRIPT}" \
-                        -t "${target}" \
+                        -t "${_zt}" \
                         -r "zap_report.html" \
                         -J "zap_report.json" \
                         -x "zap_report.xml" \
-                        -I
+                        -I \
+                    >> "${_zap_tgt_out}/zap.log" 2>&1 &
+                _zap_pids+=($!)
+                log INFO "ZAP scanning ${_zt} (PID ${_zap_pids[-1]}) → ${_zap_tgt_out}/zap_report.html"
+            done
 
-            log INFO "ZAP scanning ${target} in background → ${ZAP_DONE}"
-        done
+            # Wait for all remaining in-flight scans to finish.
+            if [[ ${#_zap_pids[@]} -gt 0 ]]; then
+                log INFO "Waiting for ${#_zap_pids[@]} ZAP scan(s) to complete..."
+                wait "${_zap_pids[@]}" 2>/dev/null || true
+            fi
+            log OK "All ZAP scans complete → ${ZAP_OUT}/"
+            unset _zap_pids _zap_pending _zap_alive _zap_safe _zap_tgt_out _zt _zp
+        fi
     fi
 fi
 
