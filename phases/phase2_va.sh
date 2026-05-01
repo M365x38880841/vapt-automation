@@ -183,7 +183,10 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     # `grep -c` prints "0" and exits 1 on no-match, so `|| echo 0` double-counts
     # the stdout; strip non-digits so the value is a safe scalar for downstream
     # arithmetic under `set -e`.
-    KERB_COUNT=$(grep -c 'ServicePrincipalName' "${AD_CHECKS}/kerberoastable_accounts.txt" 2>/dev/null || true)
+    # Count SPN-format lines (e.g. HTTP/host.domain, MSSQLSvc/host:port).
+    # Do NOT grep for 'ServicePrincipalName' — that word appears exactly once
+    # as the column header, so grep -c returns 1 regardless of account count.
+    KERB_COUNT=$(grep -cE '\S+/\S+' "${AD_CHECKS}/kerberoastable_accounts.txt" 2>/dev/null || true)
     KERB_COUNT="${KERB_COUNT//[^0-9]/}"
     KERB_COUNT="${KERB_COUNT:-0}"
     if [[ "${KERB_COUNT}" -gt 0 ]]; then
@@ -192,20 +195,32 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         log OK "Kerberoastable accounts found: 0 → ${AD_CHECKS}/kerberoastable_accounts.txt"
     fi
 
-    # AS-REP roastable accounts check
-    log INFO "Identifying AS-REP Roastable accounts..."
-    log_cmd "impacket-GetNPUsers ${DOMAIN_NAME}/ -no-pass -usersfile ..."
-    impacket-GetNPUsers \
-        "${DOMAIN_NAME}/" \
-        -no-pass \
-        -usersfile "${OUTPUT_BASE_DIR}/phase1/ad/userlist.txt" \
-        -dc-ip "${PRIMARY_DC}" \
-        -format hashcat \
+    # AS-REP roastable accounts — enumerate via LDAP, not GetNPUsers.
+    # GetNPUsers -no-pass only returns a hash when the KDC issues an AS-REP;
+    # accounts with UF_DONT_REQUIRE_PREAUTH set but with revoked/expired
+    # credentials return KDC_ERR_CLIENT_REVOKED and produce no output — so
+    # GetNPUsers silently undercounts. The LDAP bitmask query (0x400000 =
+    # 4194304) reads the userAccountControl attribute directly and finds ALL
+    # accounts with the flag, enabled or not. Phase 3 handles actual hash
+    # capture via GetNPUsers for the crackable subset.
+    log INFO "Identifying AS-REP Roastable accounts via LDAP (UF_DONT_REQUIRE_PREAUTH)..."
+    log_cmd "ldapsearch ... (userAccountControl:1.2.840.113556.1.4.803:=4194304)"
+    ldapsearch -H "ldap://${PRIMARY_DC}" \
+        -D "${DOMAIN_USER}@${DOMAIN_NAME}" \
+        -w "${DOMAIN_PASS}" \
+        -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
+        '(&(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304))' \
+        sAMAccountName userAccountControl accountExpires \
         > "${AD_CHECKS}/asrep_accounts.txt" 2>&1 || true
-    ASREP_COUNT=$(grep -c 'krb5asrep' "${AD_CHECKS}/asrep_accounts.txt" 2>/dev/null || true)
+    ASREP_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/asrep_accounts.txt" 2>/dev/null || true)
     ASREP_COUNT="${ASREP_COUNT//[^0-9]/}"
     ASREP_COUNT="${ASREP_COUNT:-0}"
-    log OK "AS-REP Roastable accounts found: ${ASREP_COUNT} → ${AD_CHECKS}/asrep_accounts.txt"
+    if [[ "${ASREP_COUNT}" -gt 0 ]]; then
+        log WARN "FINDING: ${ASREP_COUNT} account(s) with UF_DONT_REQUIRE_PREAUTH set → ${AD_CHECKS}/asrep_accounts.txt"
+        log INFO "Phase 3 will attempt hash capture for accounts the KDC responds to (excludes revoked/disabled)"
+    else
+        log OK "AS-REP Roastable accounts found: 0 → ${AD_CHECKS}/asrep_accounts.txt"
+    fi
 
     # Password policy check
     log INFO "Extracting domain password policy..."

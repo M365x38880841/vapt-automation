@@ -500,17 +500,21 @@ elif [[ -n "${BH_ZIP}" ]]; then
     log INFO "BloodHound ZIP already exists: ${BH_ZIP} — skipping collection"
 else
     log INFO "Starting BloodHound data collection (-c All)..."
+    # Run from BH_OUT_DIR so bloodhound-python writes the ZIP there regardless
+    # of which version is installed — older versions create the zip in CWD,
+    # newer versions honour -o; running from the target dir covers both.
     bg_run "bloodhound_collect" \
         "${OUT_AD}/bloodhound_collect.log" \
-        "${BLOODHOUND_BIN:-bloodhound-python}" \
-            -u "${DOMAIN_USER}" \
-            -p "${DOMAIN_PASS}" \
-            -d "${DOMAIN_NAME}" \
-            -ns "${PRIMARY_DC}" \
+        bash -c "cd '${BH_OUT_DIR}' && \
+            '${BLOODHOUND_BIN:-bloodhound-python}' \
+            -u '${DOMAIN_USER}' \
+            -p '${DOMAIN_PASS}' \
+            -d '${DOMAIN_NAME}' \
+            -ns '${PRIMARY_DC}' \
             -c All \
             --zip \
-            -w "${BH_WORKERS:-20}" \
-            -o "${BH_OUT_DIR}"
+            -w '${BH_WORKERS:-20}' \
+            -o '${BH_OUT_DIR}'"
     log INFO "BloodHound collection running in background."
 fi
 
@@ -522,20 +526,22 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         # Device code flow: modern tenants with MFA/CA — runs in foreground (interactive)
         log WARN "ROADrecon device code auth requires interactive input — running in foreground."
         log WARN "Complete the browser authentication when prompted, then the script will continue."
-        "${ROADRECON_BIN:-roadrecon}" gather \
-            --device-code \
-            --database "${ROAD_DB}" \
+        "${ROADRECON_BIN:-roadrecon}" auth --device-code \
             2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
+        "${ROADRECON_BIN:-roadrecon}" gather \
+            --database "${ROAD_DB}" \
+            2>&1 | tee -a "${OUT_CLOUD}/roadrecon.log"
         log OK "ROADrecon gather complete → ${ROAD_DB}"
     else
-        # Legacy password auth — works only on tenants without MFA enforcement.
-        # If this fails silently with an empty DB, set ROADRECON_AUTH_METHOD=devicecode in config.env
+        # Modern roadrecon requires a separate auth step before gather.
+        # Passing credentials inline to gather was removed in roadrecon v1+.
         bg_run "roadrecon_gather" \
             "${OUT_CLOUD}/roadrecon.log" \
-            "${ROADRECON_BIN:-roadrecon}" gather \
-                -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
-                -p "${DOMAIN_PASS}" \
-                --database "${ROAD_DB}"
+            bash -c "'${ROADRECON_BIN:-roadrecon}' auth \
+                -u '${DOMAIN_USER}@${DOMAIN_NAME}' \
+                -p '${DOMAIN_PASS}' \
+                && '${ROADRECON_BIN:-roadrecon}' gather \
+                --database '${ROAD_DB}'"
         log INFO "ROADrecon running in background. If DB is empty after completion, set ROADRECON_AUTH_METHOD=devicecode."
     fi
 fi
