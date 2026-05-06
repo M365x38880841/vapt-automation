@@ -262,7 +262,7 @@ if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
                 targetedKerberoast.py)
                     TKRB_DIR="/opt/targetedKerberoast"
                     if [[ ! -d "${TKRB_DIR}" ]]; then
-                        git clone https://github.com/ShutdownRepo/targetedKerberoast "${TKRB_DIR}" \
+                        sudo git clone https://github.com/ShutdownRepo/targetedKerberoast "${TKRB_DIR}" \
                             && pip_install -r "${TKRB_DIR}/requirements.txt" \
                             && sudo ln -sf "${TKRB_DIR}/targetedKerberoast.py" /usr/local/bin/targetedKerberoast.py \
                             && log OK "targetedKerberoast installed → ${TKRB_DIR}" \
