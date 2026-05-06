@@ -165,7 +165,7 @@ detect_cme
 log INFO "CME binary resolved to: ${CME_BIN}"
 
 TOOLS_REQUIRED=(nmap "${CME_BIN}" responder hashcat bloodhound-python roadrecon az docker ldapsearch)
-TOOLS_OPTIONAL=(impacket-GetUserSPNs impacket-GetNPUsers impacket-ntlmrelayx impacket-secretsdump impacket-psexec certipy-ad msfconsole)
+TOOLS_OPTIONAL=(impacket-GetUserSPNs impacket-GetNPUsers impacket-ntlmrelayx impacket-secretsdump impacket-psexec certipy-ad msfconsole targetedKerberoast.py)
 MISSING_REQUIRED=(); MISSING_OPTIONAL=()
 
 for tool in "${TOOLS_REQUIRED[@]}"; do
@@ -258,6 +258,19 @@ if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
                     ;;
                 msfconsole)
                     log WARN "Metasploit (msfconsole) not auto-installed — install via: sudo apt-get install metasploit-framework"
+                    ;;
+                targetedKerberoast.py)
+                    TKRB_DIR="/opt/targetedKerberoast"
+                    if [[ ! -d "${TKRB_DIR}" ]]; then
+                        git clone https://github.com/ShutdownRepo/targetedKerberoast "${TKRB_DIR}" \
+                            && pip_install -r "${TKRB_DIR}/requirements.txt" \
+                            && sudo ln -sf "${TKRB_DIR}/targetedKerberoast.py" /usr/local/bin/targetedKerberoast.py \
+                            && log OK "targetedKerberoast installed → ${TKRB_DIR}" \
+                            || log WARN "targetedKerberoast install failed"
+                    else
+                        log OK "targetedKerberoast already cloned at ${TKRB_DIR}"
+                        sudo ln -sf "${TKRB_DIR}/targetedKerberoast.py" /usr/local/bin/targetedKerberoast.py || true
+                    fi
                     ;;
             esac
         done
