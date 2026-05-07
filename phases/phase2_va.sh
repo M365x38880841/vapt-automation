@@ -392,17 +392,15 @@ else
 
         if [[ ${#_zap_pending[@]} -eq 0 ]]; then
             log OK "All ZAP targets already scanned — skipping"
-        elif ! checkpoint "Launch OWASP ZAP ${ZAP_SCAN_MODE:-baseline} scan against ${#_zap_pending[@]} target(s) (${ZAP_CONCURRENCY} concurrent)?"; then
-            log INFO "ZAP scans skipped by operator"
         else
+            log INFO "${#_zap_pending[@]} ZAP target(s) pending. You will be prompted for each one."
+            log INFO "Max concurrent scans: ${ZAP_CONCURRENCY} (set ZAP_CONCURRENCY in config.env to change)"
             _zap_pids=()
             for _zt in "${_zap_pending[@]}"; do
-                _zap_safe="${_zt//[^a-zA-Z0-9._-]/_}"
-                _zap_tgt_out="${ZAP_OUT}/${_zap_safe}"
-                mkdir -p "${_zap_tgt_out}"
-
-                # Throttle: wait for a free slot before starting the next container.
+                # Per-target gate: wait for any in-flight scans to clear the concurrency
+                # slot before prompting — operator sees current load before deciding.
                 while [[ ${#_zap_pids[@]} -ge ${ZAP_CONCURRENCY} ]]; do
+                    log INFO "Concurrency limit (${ZAP_CONCURRENCY}) reached — waiting for a slot to free..."
                     wait -n 2>/dev/null || true
                     _zap_alive=()
                     for _zp in "${_zap_pids[@]+"${_zap_pids[@]}"}"; do
@@ -411,11 +409,16 @@ else
                     _zap_pids=("${_zap_alive[@]+"${_zap_alive[@]}"}")
                 done
 
-                log INFO "Starting ZAP scan (slot $((${#_zap_pids[@]}+1))/${ZAP_CONCURRENCY}): ${_zt}"
+                _running=${#_zap_pids[@]}
+                if ! checkpoint "Scan ${_zt}? (${_running} scan(s) currently running)"; then
+                    log INFO "Skipped: ${_zt}"
+                    continue
+                fi
+
+                _zap_safe="${_zt//[^a-zA-Z0-9._-]/_}"
+                _zap_tgt_out="${ZAP_OUT}/${_zap_safe}"
+                mkdir -p "${_zap_tgt_out}"
                 log_cmd "docker run ... zaproxy ${ZAP_SCRIPT} -t ${_zt}"
-                # ZAP writes reports relative to /zap/wrk inside the container.
-                # --network host: allows ZAP to reach internal hosts on the LAN.
-                # -I: don't fail the container on warnings (non-zero exits still logged).
                 docker run --rm \
                     --network host \
                     -v "${_zap_tgt_out}:/zap/wrk:rw" \
@@ -436,7 +439,7 @@ else
                 log INFO "Waiting for ${#_zap_pids[@]} ZAP scan(s) to complete..."
                 wait "${_zap_pids[@]}" 2>/dev/null || true
             fi
-            log OK "All ZAP scans complete → ${ZAP_OUT}/"
+            log OK "ZAP scans complete → ${ZAP_OUT}/"
             unset _zap_pids _zap_pending _zap_alive _zap_safe _zap_tgt_out _zt _zp
         fi
     fi
