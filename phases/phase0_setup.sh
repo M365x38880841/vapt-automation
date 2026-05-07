@@ -261,15 +261,28 @@ if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
                     ;;
                 targetedKerberoast.py)
                     TKRB_DIR="/opt/targetedKerberoast"
+                    # Install into a dedicated venv so its impacket dependency
+                    # is fully isolated and can never affect the system impacket
+                    # used by ntlmrelayx and the rest of the impacket suite.
                     if [[ ! -d "${TKRB_DIR}" ]]; then
                         sudo git clone https://github.com/ShutdownRepo/targetedKerberoast "${TKRB_DIR}" \
-                            && sudo pip3 install -r "${TKRB_DIR}/requirements.txt" --break-system-packages --ignore-installed -q \
-                            && sudo ln -sf "${TKRB_DIR}/targetedKerberoast.py" /usr/local/bin/targetedKerberoast.py \
-                            && log OK "targetedKerberoast installed → ${TKRB_DIR}" \
-                            || log WARN "targetedKerberoast install failed"
+                            && sudo python3 -m venv "${TKRB_DIR}/venv" \
+                            && sudo "${TKRB_DIR}/venv/bin/pip" install \
+                               -r "${TKRB_DIR}/requirements.txt" -q \
+                            && log OK "targetedKerberoast venv ready" \
+                            || { log WARN "targetedKerberoast install failed"; }
                     else
                         log OK "targetedKerberoast already cloned at ${TKRB_DIR}"
-                        sudo ln -sf "${TKRB_DIR}/targetedKerberoast.py" /usr/local/bin/targetedKerberoast.py || true
+                    fi
+                    # Wrapper script: runs the tool inside its own venv — never
+                    # activates into the shell environment, no PATH side-effects.
+                    if [[ -d "${TKRB_DIR}/venv" ]]; then
+                        printf '#!/usr/bin/env bash\nexec "%s/venv/bin/python" "%s/targetedKerberoast.py" "$@"\n' \
+                            "${TKRB_DIR}" "${TKRB_DIR}" \
+                            | sudo tee /usr/local/bin/targetedKerberoast.py > /dev/null \
+                            && sudo chmod +x /usr/local/bin/targetedKerberoast.py \
+                            && log OK "targetedKerberoast wrapper → /usr/local/bin/targetedKerberoast.py" \
+                            || log WARN "targetedKerberoast wrapper install failed"
                     fi
                     ;;
             esac
@@ -488,6 +501,34 @@ cat > "${SCOPE_FILE}" <<EOF
 }
 EOF
 log OK "Scope file written: ${SCOPE_FILE}"
+
+# ─── NTLMRELAYX COMPATIBILITY CHECK ──────────────────────────────────────────
+# Verify the system impacket version is compatible with ntlmrelayx.
+# A known breaking change in some impacket releases causes
+# NTLMRelayxConfig.setRPCOptions() to throw TypeError at protocol-client load.
+# Auto-fix: reinstall impacket from apt (Kali-tested, stable version).
+log INFO "Verifying ntlmrelayx compatibility..."
+if command -v impacket-ntlmrelayx &>/dev/null; then
+    _RELAY_TEST=$(impacket-ntlmrelayx --help 2>&1 || true)
+    if echo "${_RELAY_TEST}" | grep -q 'TypeError\|setRPCOptions'; then
+        log WARN "ntlmrelayx incompatibility detected — auto-fixing impacket via apt..."
+        if sudo apt-get install --reinstall -y python3-impacket -qq 2>/dev/null; then
+            log OK "impacket reinstalled from apt"
+        else
+            log WARN "apt reinstall failed — try manually: sudo pip3 install 'impacket==0.12.0' --break-system-packages --ignore-installed"
+        fi
+        # Re-verify after fix
+        if impacket-ntlmrelayx --help 2>&1 | grep -q 'TypeError\|setRPCOptions'; then
+            log WARN "ntlmrelayx still broken after auto-fix — Phase 3 relay will be skipped until resolved"
+        else
+            log OK "ntlmrelayx compatibility confirmed after fix"
+        fi
+    else
+        log OK "ntlmrelayx compatibility confirmed"
+    fi
+else
+    log WARN "impacket-ntlmrelayx not found — NTLM relay unavailable in Phase 3"
+fi
 
 # ─── SUMMARY ─────────────────────────────────────────────────────────────────
 echo ""

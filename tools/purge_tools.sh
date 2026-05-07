@@ -240,8 +240,41 @@ else
     skip "NetExec/CrackMapExec — skipped by operator"
 fi
 
+# ─── TARGETEDKERBEROAST ───────────────────────────────────────────────────────
+header "5. targetedKerberoast"
+
+if confirm "targetedKerberoast (clone + symlink + pip deps)"; then
+    if [[ -f /usr/local/bin/targetedKerberoast.py ]]; then
+        run "Remove targetedKerberoast.py wrapper" sudo rm -f /usr/local/bin/targetedKerberoast.py
+    else
+        skip "targetedKerberoast.py wrapper not found"
+    fi
+
+    if [[ -d /opt/targetedKerberoast ]]; then
+        run "Remove /opt/targetedKerberoast" sudo rm -rf /opt/targetedKerberoast
+    else
+        skip "/opt/targetedKerberoast not found"
+    fi
+
+    # Remove pip packages installed from its requirements.
+    # impacket is intentionally excluded (shared dep, managed separately in section 2).
+    for pkg in ldap3 dnspython pyasn1; do
+        if pip3 show "${pkg}" &>/dev/null 2>&1; then
+            run "Remove ${pkg} from system pip3" \
+                sudo pip3 uninstall -y "${pkg}" 2>/dev/null || \
+                pip3 uninstall -y "${pkg}" 2>/dev/null || true
+        else
+            skip "${pkg} not in system pip3"
+        fi
+    done
+
+    info "targetedKerberoast purge complete."
+else
+    skip "targetedKerberoast — skipped by operator"
+fi
+
 # ─── APT CACHE ───────────────────────────────────────────────────────────────
-header "5. apt cache cleanup"
+header "6. apt cache cleanup"
 if confirm "Clean apt cache (frees disk space)"; then
     run "apt-get clean" sudo apt-get clean
     run "apt-get autoclean" sudo apt-get autoclean
