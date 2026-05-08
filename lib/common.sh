@@ -186,7 +186,12 @@ require_az_login() {
     fi
     log WARN "Azure CLI session not found or expired."
     log INFO "A URL and one-time code will appear below — open the URL in any browser and enter the code."
-    az login --use-device-code
+    # Pass --tenant if configured so multi-tenant accounts authenticate to the right directory
+    if [[ -n "${AZURE_TENANT_ID:-}" ]]; then
+        az login --use-device-code --tenant "${AZURE_TENANT_ID}"
+    else
+        az login --use-device-code
+    fi
     if az account show &>/dev/null 2>&1; then
         log OK "Azure CLI authenticated successfully"
         return 0

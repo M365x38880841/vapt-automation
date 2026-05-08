@@ -114,21 +114,34 @@ AZ_SEC="${OUT_CLOUD}/security_checks"
 mkdir -p "${AZ_SEC}"
 
 if "${_az_ready}" && ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted security checks" "azure_security"; then
-    log INFO "Running Azure targeted security checks in background..."
+    log INFO "Running Azure targeted security checks in background (all subscriptions)..."
 
     bg_run "azure_sec_checks" \
         "${AZ_SEC}/az_checks.log" \
         bash -c "
             set -euo pipefail
 
-            echo '=== PUBLIC BLOB ACCESS ===' > '${AZ_SEC}/public_blob_access.txt'
-            az storage account list \
-                --query '[?allowBlobPublicAccess==\`true\`].{Name:name,RG:resourceGroup,Region:location}' \
-                --output table 2>&1 >> '${AZ_SEC}/public_blob_access.txt'
+            # Initialise output files before the loop so each subscription appends
+            > '${AZ_SEC}/public_blob_access.txt'
+            > '${AZ_SEC}/nsg_any_inbound.txt'
+            > '${AZ_SEC}/keyvault_policies.txt'
+            > '${AZ_SEC}/public_ips_vms.txt'
+            > '${AZ_SEC}/risky_roles.txt'
+            > '${AZ_SEC}/storage_no_https.txt'
+            > '${AZ_SEC}/diagnostics.txt'
 
-            echo '=== NSG ALLOW ANY INBOUND ===' > '${AZ_SEC}/nsg_any_inbound.txt'
-            az network nsg list --output json 2>/dev/null | \
-                python3 -c \"
+            for sub in ${AZURE_SUBSCRIPTION_IDS}; do
+                az account set --subscription \"\${sub}\" 2>/dev/null || continue
+                echo \"--- Subscription: \${sub} ---\"
+
+                echo \"=== PUBLIC BLOB ACCESS [\${sub}] ===\" >> '${AZ_SEC}/public_blob_access.txt'
+                az storage account list \
+                    --query '[?allowBlobPublicAccess==\`true\`].{Name:name,RG:resourceGroup,Region:location}' \
+                    --output table 2>&1 >> '${AZ_SEC}/public_blob_access.txt'
+
+                echo \"=== NSG ALLOW ANY INBOUND [\${sub}] ===\" >> '${AZ_SEC}/nsg_any_inbound.txt'
+                az network nsg list --output json 2>/dev/null | \
+                    python3 -c \"
 import json, sys
 nsgs = json.load(sys.stdin)
 for nsg in nsgs:
@@ -139,27 +152,35 @@ for nsg in nsgs:
             print(f\\\"NSG: {nsg['name']} | Port: {rule.get('destinationPortRange')} | Priority: {rule.get('priority')}\\\")
 \" >> '${AZ_SEC}/nsg_any_inbound.txt' 2>&1
 
-            echo '=== KEY VAULT ACCESS POLICIES ===' > '${AZ_SEC}/keyvault_policies.txt'
-            az keyvault list --query '[].name' --output tsv 2>/dev/null | while read kv; do
-                echo \"--- \${kv} ---\"
-                az keyvault show -n \"\${kv}\" \
-                    --query 'properties.accessPolicies[].{ObjectId:objectId,Keys:permissions.keys,Secrets:permissions.secrets}' \
-                    --output table 2>&1
-            done >> '${AZ_SEC}/keyvault_policies.txt'
+                echo \"=== KEY VAULT ACCESS POLICIES [\${sub}] ===\" >> '${AZ_SEC}/keyvault_policies.txt'
+                az keyvault list --query '[].name' --output tsv 2>/dev/null | while read kv; do
+                    echo \"--- \${kv} ---\"
+                    az keyvault show -n \"\${kv}\" \
+                        --query 'properties.accessPolicies[].{ObjectId:objectId,Keys:permissions.keys,Secrets:permissions.secrets}' \
+                        --output table 2>&1
+                done >> '${AZ_SEC}/keyvault_policies.txt'
 
-            echo '=== PUBLIC IP VMs ===' > '${AZ_SEC}/public_ips_vms.txt'
-            az vm list-ip-addresses --output table 2>&1 >> '${AZ_SEC}/public_ips_vms.txt'
+                echo \"=== PUBLIC IP VMs [\${sub}] ===\" >> '${AZ_SEC}/public_ips_vms.txt'
+                az vm list-ip-addresses --output table 2>&1 >> '${AZ_SEC}/public_ips_vms.txt'
 
-            echo '=== OVER-PRIVILEGED ROLE ASSIGNMENTS ===' > '${AZ_SEC}/risky_roles.txt'
-            az role assignment list --all \
-                --query '[?roleDefinitionName==\`Owner\` || roleDefinitionName==\`Contributor\`].{Principal:principalName,Role:roleDefinitionName,Scope:scope}' \
-                --output table 2>&1 >> '${AZ_SEC}/risky_roles.txt'
+                echo \"=== OVER-PRIVILEGED ROLE ASSIGNMENTS [\${sub}] ===\" >> '${AZ_SEC}/risky_roles.txt'
+                az role assignment list --all \
+                    --query '[?roleDefinitionName==\`Owner\` || roleDefinitionName==\`Contributor\`].{Principal:principalName,Role:roleDefinitionName,Scope:scope}' \
+                    --output table 2>&1 >> '${AZ_SEC}/risky_roles.txt'
 
-            echo '=== STORAGE ACCOUNTS WITHOUT HTTPS ONLY ===' > '${AZ_SEC}/storage_no_https.txt'
-            az storage account list \
-                --query '[?supportsHttpsTrafficOnly==\`false\`].{Name:name,RG:resourceGroup}' \
-                --output table 2>&1 >> '${AZ_SEC}/storage_no_https.txt'
+                echo \"=== STORAGE ACCOUNTS WITHOUT HTTPS ONLY [\${sub}] ===\" >> '${AZ_SEC}/storage_no_https.txt'
+                az storage account list \
+                    --query '[?supportsHttpsTrafficOnly==\`false\`].{Name:name,RG:resourceGroup}' \
+                    --output table 2>&1 >> '${AZ_SEC}/storage_no_https.txt'
 
+                echo \"=== DIAGNOSTIC SETTINGS [\${sub}] ===\" >> '${AZ_SEC}/diagnostics.txt'
+                az monitor diagnostic-settings subscription list \
+                    --output table 2>&1 >> '${AZ_SEC}/diagnostics.txt' || \
+                    echo 'Run: az monitor diagnostic-settings subscription list' >> '${AZ_SEC}/diagnostics.txt'
+
+            done
+
+            # CA policies are tenant-wide — run once outside the subscription loop
             echo '=== ENTRA ID MFA GAP (no CA policy) ===' > '${AZ_SEC}/ca_policies.txt'
             az rest --method GET \
                 --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies' \
@@ -167,14 +188,9 @@ for nsg in nsgs:
                 --output table 2>&1 >> '${AZ_SEC}/ca_policies.txt' || \
                 echo 'Requires MS Graph permission — check manually in portal' >> '${AZ_SEC}/ca_policies.txt'
 
-            echo '=== DIAGNOSTIC SETTINGS CHECK ===' > '${AZ_SEC}/diagnostics.txt'
-            az monitor diagnostic-settings subscription list \
-                --output table 2>&1 >> '${AZ_SEC}/diagnostics.txt' || \
-                echo 'Run: az monitor diagnostic-settings subscription list' >> '${AZ_SEC}/diagnostics.txt'
-
             touch '${AZ_SEC}/done.flag'
         "
-    log INFO "Azure security checks running in background."
+    log INFO "Azure security checks running in background (one pass per subscription)."
 fi
 
 # ─── STEP 2.3 — AD CHECK AUTOMATION (CME-based, no PingCastle dependency) ───
