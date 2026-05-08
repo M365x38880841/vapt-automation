@@ -523,14 +523,15 @@ ROAD_DB="${OUT_CLOUD}/roadrecon.db"
 if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
     log INFO "Starting ROADrecon Entra ID gather..."
     if [[ "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]]; then
-        # Device code flow: modern tenants with MFA/CA — runs in foreground (interactive)
-        log WARN "ROADrecon device code auth requires interactive input — running in foreground."
-        log WARN "Complete the browser authentication when prompted, then the script will continue."
-        "${ROADRECON_BIN:-roadrecon}" auth --device-code \
-            2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
+        # Device code flow: no pipes — the URL and one-time code must reach the
+        # terminal directly. Any redirect or tee buffers stdout and the code is
+        # never displayed, making interactive auth impossible.
+        log INFO "ROADrecon device code auth: a URL and code will appear below."
+        log INFO "Open the URL in any browser, enter the code, then wait here."
+        "${ROADRECON_BIN:-roadrecon}" auth --device-code
         "${ROADRECON_BIN:-roadrecon}" gather \
             --database "${ROAD_DB}" \
-            2>&1 | tee -a "${OUT_CLOUD}/roadrecon.log"
+            2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
         log OK "ROADrecon gather complete → ${ROAD_DB}"
     else
         # Modern roadrecon requires a separate auth step before gather.
