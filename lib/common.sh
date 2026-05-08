@@ -41,11 +41,16 @@ n_required = sum(
     if p.default is inspect.Parameter.empty
     and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 )
+n_accepts = len(sig.parameters)
 for call in re.findall(r'c\.setRPCOptions\(([^)]+)\)', src):
     n_passed = len(call.split(','))
     if n_passed < n_required:
         raise TypeError(
             f'setRPCOptions called with {n_passed} arg(s) but library requires {n_required}'
+        )
+    if n_passed > n_accepts:
+        raise TypeError(
+            f'setRPCOptions called with {n_passed} arg(s) but library only accepts {n_accepts}'
         )
 PYTEST
 }
@@ -109,23 +114,40 @@ _patch_ntlmrelayx_script() {
         log OK "Patched: setdumpHashes → direct attribute assignment"
     fi
 
-    # Patch 2 — setRPCOptions needs icpr_ca_name as 6th arg.
-    # Determine required arg count from the live library and add None for any gap.
-    local _n_required
-    _n_required=$(python3 -c "
-import inspect
+    # Patch 2 — align setRPCOptions call-site arg count with the live library.
+    # The method signature has changed across impacket releases (sometimes gains
+    # icpr_ca_name, sometimes loses it). Count what the library currently accepts
+    # and rewrite the call to match exactly, padding with None or trimming extras.
+    if grep -q 'c\.setRPCOptions(' "${_script}"; then
+        sudo python3 - "${_script}" <<'PYFIX'
+import sys, re, inspect
 from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
-sig = inspect.signature(NTLMRelayxConfig.setRPCOptions)
-print(sum(1 for p in sig.parameters.values()
-          if p.default is inspect.Parameter.empty))
-" 2>/dev/null || echo "0")
 
-    if [[ "${_n_required}" -ge 6 ]] && grep -q 'c\.setRPCOptions(' "${_script}"; then
-        # Append , None) to any setRPCOptions call that ends with rpc_smb_port)
-        sudo sed -i \
-            's/c\.setRPCOptions(\(options\.rpc_mode, options\.rpc_use_smb, options\.auth_smb, options\.hashes_smb, options\.rpc_smb_port\))/c.setRPCOptions(\1, None)/g' \
-            "${_script}"
-        log OK "Patched: setRPCOptions — added None for icpr_ca_name"
+path = sys.argv[1]
+src  = open(path).read()
+
+sig        = inspect.signature(NTLMRelayxConfig.setRPCOptions)
+n_accepts  = len(sig.parameters)   # excludes self (bound method)
+n_required = sum(
+    1 for p in sig.parameters.values()
+    if p.default is inspect.Parameter.empty
+)
+
+def fix_call(m):
+    args   = [a.strip() for a in m.group(1).split(',')]
+    n_have = len(args)
+    if n_have < n_required:
+        args += ['None'] * (n_required - n_have)
+    elif n_have > n_accepts:
+        args = args[:n_accepts]
+    return 'c.setRPCOptions(' + ', '.join(args) + ')'
+
+new_src = re.sub(r'c\.setRPCOptions\(([^)]+)\)', fix_call, src)
+if new_src != src:
+    open(path, 'w').write(new_src)
+    print(f'Patched setRPCOptions → {n_accepts} arg(s)')
+PYFIX
+        log OK "Patched: setRPCOptions call aligned to library signature"
     fi
 }
 
