@@ -4,6 +4,150 @@
 # Source this at the top of every phase script: source "$(dirname "$0")/../lib/common.sh"
 # ============================================================================
 
+# ─── IMPACKET COMPATIBILITY ───────────────────────────────────────────────────
+# Root cause: script/library version skew inside the installed impacket package.
+#   1. setdumpHashes() was removed from NTLMRelayxConfig in newer library builds,
+#      but older ntlmrelayx.py scripts still call c.setdumpHashes(options.dump_hashes)
+#   2. setRPCOptions() gained a required 'icpr_ca_name' 6th arg in newer library
+#      builds, but older scripts call it with 5 args
+# Swapping impacket versions does not help when both the script AND library ship
+# together in the same apt/pip package — the skew is internal.
+# The correct fix is a targeted source patch on the actual ntlmrelayx.py module
+# file (NOT /usr/share/doc/…/examples/ which is documentation and never executed).
+#
+# _impacket_relay_broken — returns 0 (true) if broken, non-zero if healthy.
+# fix_impacket_compat    — locates the live module file, inspects the library API
+#                          at runtime, and applies only the patches that are needed.
+
+_impacket_relay_broken() {
+    local _script
+    _script=$(_find_ntlmrelayx_script)
+    [[ -z "${_script}" ]] && return 0  # can't find script → treat as broken
+
+    ! python3 - "${_script}" 2>/dev/null <<'PYTEST'
+import sys, re, inspect
+from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
+
+src = open(sys.argv[1]).read()
+
+# Check 1: script calls setdumpHashes but it is no longer a method on the class
+if 'setdumpHashes' in src and not hasattr(NTLMRelayxConfig, 'setdumpHashes'):
+    raise AttributeError('script calls setdumpHashes; method absent from NTLMRelayxConfig')
+
+# Check 2: count required positional args on setRPCOptions and compare to call site
+sig = inspect.signature(NTLMRelayxConfig.setRPCOptions)
+n_required = sum(
+    1 for p in sig.parameters.values()
+    if p.default is inspect.Parameter.empty
+    and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+)
+for call in re.findall(r'c\.setRPCOptions\(([^)]+)\)', src):
+    n_passed = len(call.split(','))
+    if n_passed < n_required:
+        raise TypeError(
+            f'setRPCOptions called with {n_passed} arg(s) but library requires {n_required}'
+        )
+PYTEST
+}
+
+_find_ntlmrelayx_script() {
+    local _f _bin
+
+    # Strategy 1: importlib — works when impacket is installed as a proper package
+    _f=$(python3 -c "
+import importlib.util
+spec = importlib.util.find_spec('impacket.examples.ntlmrelayx.ntlmrelayx')
+if spec is not None and getattr(spec, 'origin', None):
+    print(spec.origin)
+" 2>/dev/null)
+    [[ -n "${_f}" && -f "${_f}" ]] && echo "${_f}" && return 0
+
+    # Strategy 2: Kali shell-wrapper pattern.
+    # /usr/bin/impacket-ntlmrelayx is a #!/bin/sh script that strips the
+    # 'impacket-' prefix and runs the matching .py file from a examples directory.
+    # Parse the wrapper to find that directory, then reconstruct the full path.
+    _bin=$(command -v impacket-ntlmrelayx 2>/dev/null)
+    if [[ -n "${_bin}" ]]; then
+        if head -1 "${_bin}" 2>/dev/null | grep -q '#!/bin/sh\|#!/bin/bash'; then
+            # Extract any absolute path that contains 'examples' from the wrapper body
+            _f=$(grep -oP '/[^\s"$]+examples[^\s"$]*' "${_bin}" 2>/dev/null \
+                 | sed 's|/$||' \
+                 | head -1)
+            if [[ -n "${_f}" ]]; then
+                # _f is the examples directory; append the script name
+                _f="${_f}/ntlmrelayx.py"
+                [[ -f "${_f}" ]] && echo "${_f}" && return 0
+            fi
+        elif head -1 "${_bin}" 2>/dev/null | grep -q 'python'; then
+            # Binary is itself a Python script
+            echo "${_bin}" && return 0
+        fi
+    fi
+
+    # Strategy 3: filesystem search — include all paths.
+    # On Kali's shell-wrapper layout the doc example IS the executed script,
+    # so /doc/ paths are intentionally not excluded here.
+    find /usr /opt -name "ntlmrelayx.py" 2>/dev/null | head -1
+}
+
+_patch_ntlmrelayx_script() {
+    local _script
+    _script=$(_find_ntlmrelayx_script)
+
+    if [[ -z "${_script}" || ! -f "${_script}" ]]; then
+        log WARN "Could not locate impacket ntlmrelayx module — patch skipped"
+        return 1
+    fi
+    log INFO "Patching: ${_script}"
+    sudo cp "${_script}" "${_script}.bak.$(date +%s)"
+
+    # Patch 1 — setdumpHashes removed: replace with direct attribute write
+    if grep -q 'setdumpHashes' "${_script}"; then
+        sudo sed -i \
+            's/c\.setdumpHashes(\(options\.[^)]*\))/c.dumpHashes = \1/g' \
+            "${_script}"
+        log OK "Patched: setdumpHashes → direct attribute assignment"
+    fi
+
+    # Patch 2 — setRPCOptions needs icpr_ca_name as 6th arg.
+    # Determine required arg count from the live library and add None for any gap.
+    local _n_required
+    _n_required=$(python3 -c "
+import inspect
+from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
+sig = inspect.signature(NTLMRelayxConfig.setRPCOptions)
+print(sum(1 for p in sig.parameters.values()
+          if p.default is inspect.Parameter.empty))
+" 2>/dev/null || echo "0")
+
+    if [[ "${_n_required}" -ge 6 ]] && grep -q 'c\.setRPCOptions(' "${_script}"; then
+        # Append , None) to any setRPCOptions call that ends with rpc_smb_port)
+        sudo sed -i \
+            's/c\.setRPCOptions(\(options\.rpc_mode, options\.rpc_use_smb, options\.auth_smb, options\.hashes_smb, options\.rpc_smb_port\))/c.setRPCOptions(\1, None)/g' \
+            "${_script}"
+        log OK "Patched: setRPCOptions — added None for icpr_ca_name"
+    fi
+}
+
+fix_impacket_compat() {
+    if ! _impacket_relay_broken; then
+        log OK "impacket relay API healthy"
+        return 0
+    fi
+    log WARN "impacket relay API broken — applying source patch to live module"
+
+    _patch_ntlmrelayx_script
+
+    if ! _impacket_relay_broken; then
+        log OK "impacket relay API fixed via source patch"
+        return 0
+    fi
+
+    log WARN "Source patch did not fully resolve the issue — check manually:"
+    log WARN "  python3 -c \"import importlib.util; spec = importlib.util.find_spec('impacket.examples.ntlmrelayx.ntlmrelayx'); print(spec.origin)\""
+    return 1
+}
+
 # ─── DOCKER COMPOSE WRAPPER ───────────────────────────────────────────────────
 # Resolves the correct docker compose invocation at runtime.
 # - Prefers   "docker compose" (v2 plugin — docker-ce + docker-compose-plugin)
