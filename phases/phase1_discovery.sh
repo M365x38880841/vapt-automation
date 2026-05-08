@@ -550,6 +550,9 @@ fi
 # ─── STEP 1.9 — AZURE RESOURCE INVENTORY (background) ────────────────────────
 AZURE_INV="${OUT_CLOUD}/azure_inventory.json"
 if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory" "azure_inventory"; then
+    if ! require_az_login; then
+        log WARN "Skipping Azure resource inventory — authenticate with az login first"
+    else
     log INFO "Starting Azure resource inventory across all subscriptions..."
     bg_run "azure_inventory" \
         "${OUT_CLOUD}/azure_inventory.log" \
@@ -582,6 +585,7 @@ if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory" "azure_inventory";
             az role assignment list --all --output table > '${OUT_CLOUD}/role_assignments.txt' 2>&1 || true
         "
     log INFO "Azure inventory running in background (one JSON file per subscription → merged into azure_inventory.json)."
+    fi  # end require_az_login gate
 fi
 
 # NOTE: SMB signing check previously lived here — moved up to run inline

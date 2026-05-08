@@ -63,6 +63,19 @@ if ! _step_is_skipped "ad_checks" quiet; then
     require_file "${LIVE_HOSTS}"
 fi
 
+# ─── AZURE CLI AUTH (covers all az-based steps in this phase) ────────────────
+# ScoutSuite, azure_security, and any other az commands in phase 2 all run
+# inside bg_run where interactive prompts are impossible. Authenticate once
+# here in the foreground before any background jobs are launched.
+_az_ready=false
+if _step_is_skipped "scoutsuite" quiet && _step_is_skipped "azure_security" quiet; then
+    _az_ready=true  # all az steps skipped — no auth needed
+elif require_az_login; then
+    _az_ready=true
+else
+    log WARN "Azure CLI auth failed — scoutsuite and azure_security steps will be skipped"
+fi
+
 # ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background — one job per subscription) ─
 # Runs against ALL subscriptions, not just the first one.
 SCOUT_REPORT_DIR="${OUT_CLOUD}/scoutsuite"
@@ -70,7 +83,7 @@ mkdir -p "${SCOUT_REPORT_DIR}"
 
 # Skip the entire scoutsuite block if scoutsuite is excluded OR if no
 # subscription IDs are configured — `for x in ${UNSET}` aborts under `set -u`.
-if _step_is_skipped "scoutsuite" quiet; then
+if ! "${_az_ready}" || _step_is_skipped "scoutsuite" quiet; then
     log INFO "Skipping: scoutsuite"
 elif [[ -z "${AZURE_SUBSCRIPTION_IDS:-}" ]]; then
     log WARN "AZURE_SUBSCRIPTION_IDS not set — scoutsuite skipped."
@@ -100,7 +113,7 @@ fi  # end scoutsuite + AZURE_SUBSCRIPTION_IDS guard
 AZ_SEC="${OUT_CLOUD}/security_checks"
 mkdir -p "${AZ_SEC}"
 
-if ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted security checks" "azure_security"; then
+if "${_az_ready}" && ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted security checks" "azure_security"; then
     log INFO "Running Azure targeted security checks in background..."
 
     bg_run "azure_sec_checks" \

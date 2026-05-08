@@ -170,6 +170,31 @@ fix_impacket_compat() {
     return 1
 }
 
+# ─── AZURE CLI AUTH GUARD ─────────────────────────────────────────────────────
+# All Azure/Entra steps (inventory, ScoutSuite, security checks) run az commands
+# inside bg_run background jobs where interactive prompts are impossible.
+# Call require_az_login before any bg_run that uses az — it verifies the session
+# and handles re-auth interactively in the foreground before the job is launched.
+# Uses --use-device-code so it works on headless pentest boxes with no browser.
+require_az_login() {
+    if az account show &>/dev/null 2>&1; then
+        local _acct
+        _acct=$(az account show --query '[name, user.name]' -o tsv 2>/dev/null \
+                | tr '\n' ' ' | xargs)
+        log OK "Azure CLI authenticated: ${_acct}"
+        return 0
+    fi
+    log WARN "Azure CLI session not found or expired."
+    log INFO "A URL and one-time code will appear below — open the URL in any browser and enter the code."
+    az login --use-device-code
+    if az account show &>/dev/null 2>&1; then
+        log OK "Azure CLI authenticated successfully"
+        return 0
+    fi
+    log ERROR "Azure CLI authentication failed — Azure/Entra cloud steps will be skipped"
+    return 1
+}
+
 # ─── DOCKER COMPOSE WRAPPER ───────────────────────────────────────────────────
 # Resolves the correct docker compose invocation at runtime.
 # - Prefers   "docker compose" (v2 plugin — docker-ce + docker-compose-plugin)
