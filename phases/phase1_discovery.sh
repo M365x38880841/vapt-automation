@@ -535,14 +535,18 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         log OK "ROADrecon gather complete → ${ROAD_DB}"
     else
         # Modern roadrecon requires a separate auth step before gather.
-        # Passing credentials inline to gather was removed in roadrecon v1+.
+        # Run auth in the foreground (it's a quick MSAL token request) so
+        # credentials are never inline-interpolated into a bash -c string —
+        # that breaks silently when the password contains single-quotes or
+        # other shell-special characters.  Gather is then safe to background.
+        log INFO "ROADrecon: authenticating (username/password)..."
+        "${ROADRECON_BIN:-roadrecon}" auth \
+            -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
+            -p "${DOMAIN_PASS}"
         bg_run "roadrecon_gather" \
             "${OUT_CLOUD}/roadrecon.log" \
-            bash -c "'${ROADRECON_BIN:-roadrecon}' auth \
-                -u '${DOMAIN_USER}@${DOMAIN_NAME}' \
-                -p '${DOMAIN_PASS}' \
-                && '${ROADRECON_BIN:-roadrecon}' gather \
-                --database '${ROAD_DB}'"
+            "${ROADRECON_BIN:-roadrecon}" gather \
+                --database "${ROAD_DB}"
         log INFO "ROADrecon running in background. If DB is empty after completion, set ROADRECON_AUTH_METHOD=devicecode."
     fi
 fi

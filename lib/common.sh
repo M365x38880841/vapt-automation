@@ -34,14 +34,17 @@ src = open(sys.argv[1]).read()
 if 'setdumpHashes' in src and not hasattr(NTLMRelayxConfig, 'setdumpHashes'):
     raise AttributeError('script calls setdumpHashes; method absent from NTLMRelayxConfig')
 
-# Check 2: count required positional args on setRPCOptions and compare to call site
+# Check 2: count required positional args on setRPCOptions and compare to call site.
+# inspect.signature on an unbound class method includes 'self'; exclude it so
+# the counts represent the args that appear at the call site (c.setRPCOptions(...)).
 sig = inspect.signature(NTLMRelayxConfig.setRPCOptions)
+params = [p for name, p in sig.parameters.items() if name != 'self']
 n_required = sum(
-    1 for p in sig.parameters.values()
+    1 for p in params
     if p.default is inspect.Parameter.empty
     and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 )
-n_accepts = len(sig.parameters)
+n_accepts = len(params)
 for call in re.findall(r'c\.setRPCOptions\(([^)]+)\)', src):
     n_passed = len(call.split(','))
     if n_passed < n_required:
@@ -126,10 +129,13 @@ from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
 path = sys.argv[1]
 src  = open(path).read()
 
+# inspect.signature on an unbound method includes 'self'; strip it so n_accepts
+# and n_required reflect only the args that appear at the call site.
 sig        = inspect.signature(NTLMRelayxConfig.setRPCOptions)
-n_accepts  = len(sig.parameters)   # excludes self (bound method)
+params     = [p for name, p in sig.parameters.items() if name != 'self']
+n_accepts  = len(params)
 n_required = sum(
-    1 for p in sig.parameters.values()
+    1 for p in params
     if p.default is inspect.Parameter.empty
 )
 

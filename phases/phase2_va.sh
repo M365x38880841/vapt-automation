@@ -99,6 +99,7 @@ for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
             bg_run "scoutsuite_${sub_id}" \
                 "${OUT_CLOUD}/scoutsuite_${sub_id}.log" \
                 "${SCOUT_CMD_ARRAY[@]}" azure \
+                    -c \
                     --tenant "${AZURE_TENANT_ID}" \
                     --subscription-id "${sub_id}" \
                     --report-dir "${SCOUT_REPORT_SUB}" \
