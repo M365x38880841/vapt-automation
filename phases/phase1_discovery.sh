@@ -28,6 +28,9 @@ set_primary_dc   # sets PRIMARY_DC = first IP in DC_IP
 # kept in the list for backwards-compat with earlier cred-gating logic.
 _needs_domain_creds=false
 for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon password_spray; do
+    # roadrecon device-code auth is fully interactive — it does not consume
+    # DOMAIN_USER or DOMAIN_PASS, so skip it from the cred-requirement probe.
+    [[ "${_cred_step}" == "roadrecon" && "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]] && continue
     if ! _step_is_skipped "${_cred_step}" quiet; then
         _needs_domain_creds=true; break
     fi
