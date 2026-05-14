@@ -95,11 +95,20 @@ else
     set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
     if checkpoint "Launch ScoutSuite Azure audit across all subscriptions in the active CLI session? (foreground — est. 25–60 min)"; then
         log INFO "Starting ScoutSuite Azure audit — covers all subscriptions visible to the active session..."
+        # Capture exit code explicitly — ScoutSuite uses non-zero codes for non-error
+        # conditions (e.g. 200 when writing the HTML report over an existing file).
+        # Without this, set -e would abort the entire phase on those codes.
+        _scout_rc=0
         "${SCOUT_CMD_ARRAY[@]}" azure \
             -c \
             --report-dir "${SCOUT_REPORT_DIR}" \
-            --no-browser
-        log OK "ScoutSuite Azure audit complete → ${SCOUT_REPORT_DIR}"
+            --no-browser || _scout_rc=$?
+        if [[ "${_scout_rc}" -eq 0 ]]; then
+            log OK "ScoutSuite Azure audit complete → ${SCOUT_REPORT_DIR}"
+        else
+            log WARN "ScoutSuite exited with code ${_scout_rc} — review output above; report may still be usable in ${SCOUT_REPORT_DIR}"
+        fi
+        unset _scout_rc
     fi
 fi  # end scoutsuite guard
 

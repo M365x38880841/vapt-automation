@@ -726,6 +726,191 @@ prompt_credential() {
     export "${varname?}"
 }
 
+# ─── AZUREHOUND AUTH SELECTION ───────────────────────────────────────────────
+# Prompts the operator to choose an AzureHound auth method if AZUREHOUND_AUTH_METHOD
+# is not already set in the environment, then collects the credentials required for
+# the chosen method via prompt_credential.
+# Supported methods: devicecode | clientsecret | refreshtoken | password
+# Sets and exports: AZUREHOUND_AUTH_METHOD and all method-specific credential vars.
+_azurehound_select_auth() {
+    local _valid_methods="devicecode clientsecret refreshtoken password"
+    local _m _found
+
+    if [[ -n "${AZUREHOUND_AUTH_METHOD:-}" ]]; then
+        _found=false
+        for _m in ${_valid_methods}; do
+            [[ "${AZUREHOUND_AUTH_METHOD}" == "${_m}" ]] && _found=true && break
+        done
+        if ! "${_found}"; then
+            log WARN "AZUREHOUND_AUTH_METHOD='${AZUREHOUND_AUTH_METHOD}' is not valid. Must be one of: ${_valid_methods}"
+            unset AZUREHOUND_AUTH_METHOD
+        else
+            log INFO "AzureHound auth method (from env): ${AZUREHOUND_AUTH_METHOD}"
+        fi
+    fi
+
+    if [[ -z "${AZUREHOUND_AUTH_METHOD:-}" ]]; then
+        echo -e "\n${BOLD}${CYAN}──────────────────────────────────────────────────────────────${RESET}"
+        echo -e "${BOLD}${CYAN}  AzureHound — Select authentication method${RESET}"
+        echo -e "${BOLD}${CYAN}──────────────────────────────────────────────────────────────${RESET}"
+        echo -e "  ${BOLD}1)${RESET} device code    — browser device flow ${BOLD}(recommended; works with MFA)${RESET}"
+        echo -e "  ${BOLD}2)${RESET} client secret  — app registration + secret (unattended / CI re-runs)"
+        echo -e "  ${BOLD}3)${RESET} refresh token  — reuse a cached token from a prior device-code session"
+        echo -e "  ${BOLD}4)${RESET} password       — username/password ${YELLOW}(blocked when MFA is enforced)${RESET}"
+        echo -e "${BOLD}  Choice [1]: ${RESET}\c"
+        local _choice
+        read -r _choice
+        case "${_choice:-1}" in
+            1|"") AZUREHOUND_AUTH_METHOD="devicecode" ;;
+            2)    AZUREHOUND_AUTH_METHOD="clientsecret" ;;
+            3)    AZUREHOUND_AUTH_METHOD="refreshtoken" ;;
+            4)    AZUREHOUND_AUTH_METHOD="password" ;;
+            *)    log WARN "Unrecognised choice '${_choice}' — defaulting to device code"
+                  AZUREHOUND_AUTH_METHOD="devicecode" ;;
+        esac
+        export AZUREHOUND_AUTH_METHOD
+        log INFO "AzureHound auth method selected: ${AZUREHOUND_AUTH_METHOD}"
+    fi
+
+    # Collect credentials required for the chosen method
+    case "${AZUREHOUND_AUTH_METHOD}" in
+        devicecode)
+            ;;  # no stored credentials — interactive browser flow handles everything
+        clientsecret)
+            prompt_credential "AZURE_CLIENT_ID"
+            prompt_credential "AZURE_CLIENT_SECRET"
+            ;;
+        refreshtoken)
+            prompt_credential "AZUREHOUND_REFRESH_TOKEN"
+            ;;
+        password)
+            prompt_credential "DOMAIN_USER"
+            prompt_credential "DOMAIN_PASS"
+            normalise_domain_user
+            ;;
+    esac
+    unset _m _found _choice
+}
+
+# ─── AZUREHOUND OUTPUT VALIDATION ────────────────────────────────────────────
+# Parses azurehound.json (NDJSON — one {"kind":"...","data":{}} per line),
+# counts per-kind objects, saves a machine-readable summary, detects ARM-empty
+# collections (missing subscription Reader), and scrapes the gather log for
+# known error fingerprints (403, 429, AADSTS, timeouts).
+# Usage: _azurehound_validate_output <json_file> [<log_file>]
+_azurehound_validate_output() {
+    local json_file="$1"
+    local log_file="${2:-}"
+    local summary_file="${json_file%.*}_summary.json"
+
+    if [[ ! -s "${json_file}" ]]; then
+        log WARN "AzureHound output is empty or missing: ${json_file}"
+        return 1
+    fi
+
+    # Count per-kind records.  AzureHound v2 writes NDJSON (one JSON object
+    # per line); Python handles the format correctly and is always available.
+    local _kind_counts
+    _kind_counts=$(python3 - "${json_file}" "${summary_file}" 2>/dev/null <<'PYVAL'
+import sys, json, collections
+
+kinds = collections.Counter()
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict) and 'kind' in obj:
+                kinds[obj['kind']] += 1
+        except Exception:
+            pass
+
+summary = {"total": sum(kinds.values()), "kinds": dict(kinds)}
+with open(sys.argv[2], 'w') as out:
+    json.dump(summary, out, indent=2)
+
+for k, v in sorted(kinds.items()):
+    print(f'{v} {k}')
+PYVAL
+)
+
+    if [[ -z "${_kind_counts}" ]]; then
+        log WARN "AzureHound: unable to parse kind counts — file may be malformed or use an unsupported format"
+        return 1
+    fi
+
+    # Print per-kind table
+    echo -e "${CYAN}  AzureHound collection summary:${RESET}"
+    while IFS=' ' read -r _cnt _knd; do
+        printf "    %-8s  %s\n" "${_cnt}" "${_knd}"
+    done <<< "${_kind_counts}"
+
+    # Tally Entra-tier vs ARM-tier kinds separately
+    local _entra_total=0 _arm_total=0 _cnt _knd
+    while IFS=' ' read -r _cnt _knd; do
+        case "${_knd}" in
+            AZUser|AZGroup|AZRole|AZServicePrincipal|AZTenant|AZApp|AZDevice)
+                _entra_total=$(( _entra_total + _cnt )) ;;
+            AZSubscription|AZResourceGroup|AZVM|AZKeyVault|AZRoleAssignment|\
+            AZStorageAccount|AZAutomationAccount|AZFunctionApp|AZWebApp|AZManagedCluster)
+                _arm_total=$(( _arm_total + _cnt )) ;;
+        esac
+    done <<< "${_kind_counts}"
+
+    if [[ "${_entra_total}" -gt 0 && "${_arm_total}" -gt 0 ]]; then
+        log OK "AzureHound: Entra=${_entra_total} objects, ARM=${_arm_total} objects — full hybrid coverage"
+    elif [[ "${_entra_total}" -gt 0 && "${_arm_total}" -eq 0 ]]; then
+        log WARN "AzureHound: Entra data collected (${_entra_total} objects) but ARM data is EMPTY."
+        log WARN "  Cause: the authenticated principal likely has no Reader role on the target subscriptions."
+        if [[ -n "${AZURE_SUBSCRIPTION_IDS:-}" ]]; then
+            log WARN "  In-scope subscriptions: ${AZURE_SUBSCRIPTION_IDS}"
+            log WARN "  Fix: az role assignment create --role Reader --assignee <upn> \\"
+            log WARN "         --scope /subscriptions/<id>    (repeat per subscription)"
+        fi
+        if [[ "${AZUREHOUND_GRAPH_ONLY:-false}" == "true" ]]; then
+            log INFO "  AZUREHOUND_GRAPH_ONLY=true — ARM-empty warning suppressed (Entra-only collection intended)"
+        else
+            log WARN "  To suppress this warning when ARM access is intentionally out of scope:"
+            log WARN "    export AZUREHOUND_GRAPH_ONLY=true"
+            log WARN "  To re-run after granting Reader on the subscriptions:"
+            log WARN "    FORCE_AZUREHOUND_REFRESH=1 bash phases/phase1_discovery.sh"
+        fi
+    elif [[ "${_entra_total}" -eq 0 && "${_arm_total}" -eq 0 ]]; then
+        log ERROR "AzureHound: both Entra and ARM data are EMPTY. Verify authentication and permissions."
+        unset _kind_counts _entra_total _arm_total _cnt _knd
+        return 1
+    fi
+
+    # Scrape the gather log for known error classes
+    if [[ -n "${log_file}" && -f "${log_file}" ]]; then
+        local _e403 _e429 _eaad _etmo
+        _e403=$(grep -c '403\|Forbidden\|Authorization_RequestDenied'   "${log_file}" 2>/dev/null || echo 0)
+        _e429=$(grep -c '429\|throttl\|TooManyRequests'                  "${log_file}" 2>/dev/null || echo 0)
+        _eaad=$(grep -c 'AADSTS'                                         "${log_file}" 2>/dev/null || echo 0)
+        _etmo=$(grep -c 'context deadline exceeded\|timed out'           "${log_file}" 2>/dev/null || echo 0)
+        _e403="${_e403//[^0-9]/}"; _e403="${_e403:-0}"
+        _e429="${_e429//[^0-9]/}"; _e429="${_e429:-0}"
+        _eaad="${_eaad//[^0-9]/}"; _eaad="${_eaad:-0}"
+        _etmo="${_etmo//[^0-9]/}"; _etmo="${_etmo:-0}"
+
+        if (( _e403 > 0 || _e429 > 0 || _eaad > 0 || _etmo > 0 )); then
+            log WARN "AzureHound log errors detected — collection may be incomplete:"
+            (( _e403 > 0 )) && log WARN "  403/Forbidden:  ${_e403} — permission denied on some Graph/ARM endpoints"
+            (( _e429 > 0 )) && log WARN "  429/throttle:   ${_e429} — Graph API rate-limited (partial collection)"
+            (( _eaad > 0 )) && log WARN "  AADSTS:         ${_eaad} — authentication error (check token / MFA state)"
+            (( _etmo > 0 )) && log WARN "  Timeout:        ${_etmo} — context deadline exceeded"
+            log WARN "  Full log: ${log_file}"
+        fi
+        unset _e403 _e429 _eaad _etmo
+    fi
+
+    log INFO "Kind summary written → ${summary_file}"
+    unset _kind_counts _entra_total _arm_total _cnt _knd
+    return 0
+}
+
 # ─── OUTPUT DIRECTORY HELPER ──────────────────────────────────────────────────
 phase_dir() {
     local phase="$1"; local subdir="${2:-}"

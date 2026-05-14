@@ -165,7 +165,7 @@ detect_cme
 log INFO "CME binary resolved to: ${CME_BIN}"
 
 TOOLS_REQUIRED=(nmap "${CME_BIN}" responder hashcat bloodhound-python roadrecon az docker ldapsearch)
-TOOLS_OPTIONAL=(impacket-GetUserSPNs impacket-GetNPUsers impacket-ntlmrelayx impacket-secretsdump impacket-psexec certipy-ad msfconsole targetedKerberoast.py)
+TOOLS_OPTIONAL=(impacket-GetUserSPNs impacket-GetNPUsers impacket-ntlmrelayx impacket-secretsdump impacket-psexec certipy-ad msfconsole targetedKerberoast.py azurehound)
 MISSING_REQUIRED=(); MISSING_OPTIONAL=()
 
 for tool in "${TOOLS_REQUIRED[@]}"; do
@@ -284,6 +284,62 @@ if [[ ${#MISSING_OPTIONAL[@]} -gt 0 ]]; then
                             && log OK "targetedKerberoast wrapper → /usr/local/bin/targetedKerberoast.py" \
                             || log WARN "targetedKerberoast wrapper install failed"
                     fi
+                    ;;
+                azurehound)
+                    # AzureHound: pre-built Go binary, not in apt or pip.
+                    # Detect OS + architecture and download the correct binary from
+                    # the latest GitHub release.  Supported: linux/darwin × amd64/arm64.
+                    _azh_os=""
+                    _azh_arch=""
+                    case "$(uname -m)" in
+                        x86_64)        _azh_arch="amd64" ;;
+                        aarch64|arm64) _azh_arch="arm64" ;;
+                        *) log WARN "AzureHound: unsupported arch $(uname -m) — install manually:" ;;
+                    esac
+                    case "$(uname -s)" in
+                        Linux)  _azh_os="linux" ;;
+                        Darwin) _azh_os="darwin" ;;
+                        *) log WARN "AzureHound: unsupported OS $(uname -s) — install manually:" ;;
+                    esac
+                    if [[ -z "${_azh_os}" || -z "${_azh_arch}" ]]; then
+                        log WARN "  https://github.com/BloodHoundAD/AzureHound/releases"
+                    else
+                        log INFO "Fetching latest AzureHound release for ${_azh_os}-${_azh_arch}..."
+                        _azh_asset="${_azh_os}-${_azh_arch}"
+                        _azh_url=$(curl -fsSL \
+                            "https://api.github.com/repos/BloodHoundAD/AzureHound/releases/latest" \
+                            2>/dev/null \
+                            | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for a in data.get('assets', []):
+        n = a['name']
+        if '${_azh_asset}' in n and not n.endswith('.sha256') and not n.endswith('.zip'):
+            print(a['browser_download_url']); break
+except Exception:
+    pass
+" 2>/dev/null)
+                        if [[ -z "${_azh_url}" ]]; then
+                            log WARN "Could not resolve AzureHound download URL (GitHub API may be rate-limited)."
+                            log WARN "  Install manually: https://github.com/BloodHoundAD/AzureHound/releases"
+                            log WARN "  Place the binary at /usr/local/bin/azurehound and chmod +x."
+                        else
+                            log INFO "Downloading: ${_azh_url}"
+                            _azh_tmp=$(mktemp /tmp/azurehound.XXXXXX)
+                            if curl -fsSL -o "${_azh_tmp}" "${_azh_url}"; then
+                                sudo install -m 0755 "${_azh_tmp}" /usr/local/bin/azurehound
+                                rm -f "${_azh_tmp}"
+                                log OK "AzureHound installed → /usr/local/bin/azurehound"
+                            else
+                                log WARN "AzureHound download failed — install manually:"
+                                log WARN "  https://github.com/BloodHoundAD/AzureHound/releases"
+                                rm -f "${_azh_tmp}"
+                            fi
+                        fi
+                        unset _azh_url _azh_tmp _azh_asset
+                    fi
+                    unset _azh_os _azh_arch
                     ;;
             esac
         done

@@ -27,10 +27,12 @@ set_primary_dc   # sets PRIMARY_DC = first IP in DC_IP
 # ldap_banner itself does not need creds (nmap script is anonymous) but is
 # kept in the list for backwards-compat with earlier cred-gating logic.
 _needs_domain_creds=false
-for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon password_spray; do
-    # roadrecon device-code auth is fully interactive — it does not consume
-    # DOMAIN_USER or DOMAIN_PASS, so skip it from the cred-requirement probe.
-    [[ "${_cred_step}" == "roadrecon" && "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]] && continue
+for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon azurehound password_spray; do
+    # device-code auth modes are fully interactive and consume no stored credentials.
+    [[ "${_cred_step}" == "roadrecon"  && "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]] && continue
+    # azurehound always skipped here — _azurehound_select_auth() in Step 1.9 prompts
+    # for the auth method and collects all required credentials at runtime.
+    [[ "${_cred_step}" == "azurehound" ]] && continue
     if ! _step_is_skipped "${_cred_step}" quiet; then
         _needs_domain_creds=true; break
     fi
@@ -525,19 +527,54 @@ fi
 ROAD_DB="${OUT_CLOUD}/roadrecon.db"
 if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
     log INFO "Starting ROADrecon Entra ID gather..."
+
+    # Probe for --graph support at runtime.  ROADrecon currently uses graph.windows.net
+    # (Azure AD Graph API, deprecated Sep 2024).  If the tenant has blocked AAD Graph
+    # for third-party apps, every gather request returns 403 and the database is empty.
+    # A future roadrecon release may add --graph to use graph.microsoft.com instead;
+    # probe for it now so the script picks it up automatically when it lands.
+    _road_gather_graph_flag=""
+    if "${ROADRECON_BIN:-roadrecon}" gather --help 2>&1 | grep -q -- '--graph'; then
+        _road_gather_graph_flag="--graph"
+        log INFO "ROADrecon: --graph flag detected — will use Microsoft Graph API"
+    else
+        log WARN "ROADrecon: tool uses Azure AD Graph API (graph.windows.net)."
+        log WARN "  If the tenant restricts AAD Graph for third-party apps, all gather"
+        log WARN "  requests will return 403 and the database will be empty."
+        log WARN "  Alternative: Entra ID objects are also collected via 'az ad' commands"
+        log WARN "  in step 1.10 (azure_inventory). For full BloodHound-style Entra analysis,"
+        log WARN "  consider AzureHound which uses the Microsoft Graph API instead."
+    fi
+
     if [[ "${ROADRECON_AUTH_METHOD:-password}" == "devicecode" ]]; then
         # Device code flow: no pipes — the URL and one-time code must reach the
         # terminal directly. Any redirect or tee buffers stdout and the code is
         # never displayed, making interactive auth impossible.
         log INFO "ROADrecon device code auth: a URL and code will appear below."
         log INFO "Open the URL in any browser, enter the code, then wait here."
-        "${ROADRECON_BIN:-roadrecon}" auth \
-            --device-code \
-            --client-id "${ROADRECON_CLIENT_ID:-04b07795-8542-4c4b-a642-e0b5593ee2f8}"
+        "${ROADRECON_BIN:-roadrecon}" auth --device-code
         "${ROADRECON_BIN:-roadrecon}" gather \
             --database "${ROAD_DB}" \
+            ${_road_gather_graph_flag:+"${_road_gather_graph_flag}"} \
             2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
-        log OK "ROADrecon gather complete → ${ROAD_DB}"
+        # Check whether anything was actually collected.  A user count of 0 means
+        # AAD Graph was blocked — warn so the operator knows the GUI will be empty.
+        _road_user_count=$(python3 -c "
+import sqlite3, sys
+try:
+    c = sqlite3.connect('${ROAD_DB}')
+    print(c.execute('SELECT COUNT(*) FROM Users').fetchone()[0])
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+        if [[ "${_road_user_count:-0}" -gt 0 ]]; then
+            log OK "ROADrecon gather complete — ${_road_user_count} users collected → ${ROAD_DB}"
+        else
+            log WARN "ROADrecon database is empty (0 users) — AAD Graph API was likely blocked."
+            log WARN "  Entra data is still available via step 1.10 azure_inventory (az ad commands)."
+            log WARN "  GUI analysis will not be possible until gather collects data."
+        fi
+        unset _road_user_count
     else
         # Modern roadrecon requires a separate auth step before gather.
         # Run auth in the foreground (it's a quick MSAL token request) so
@@ -547,17 +584,134 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         log INFO "ROADrecon: authenticating (username/password)..."
         "${ROADRECON_BIN:-roadrecon}" auth \
             -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
-            -p "${DOMAIN_PASS}" \
-            --client-id "${ROADRECON_CLIENT_ID:-04b07795-8542-4c4b-a642-e0b5593ee2f8}"
+            -p "${DOMAIN_PASS}"
         bg_run "roadrecon_gather" \
             "${OUT_CLOUD}/roadrecon.log" \
             "${ROADRECON_BIN:-roadrecon}" gather \
-                --database "${ROAD_DB}"
-        log INFO "ROADrecon running in background. If DB is empty after completion, set ROADRECON_AUTH_METHOD=devicecode."
+                --database "${ROAD_DB}" \
+                ${_road_gather_graph_flag:+"${_road_gather_graph_flag}"}
+        log INFO "ROADrecon running in background. If DB is empty after gather, upgrade roadrecon: pip3 install --upgrade roadrecon"
+    fi
+    unset _road_gather_graph_flag
+fi
+
+# ─── STEP 1.9 — AZUREHOUND ENTRA ID GATHER ───────────────────────────────────
+# AzureHound uses Microsoft Graph API (graph.microsoft.com) — not affected by the
+# AAD Graph (graph.windows.net) block that empties the ROADrecon database.
+# Output is a BloodHound CE-compatible NDJSON file.
+#
+# Auth method is selected interactively at runtime if AZUREHOUND_AUTH_METHOD is
+# not pre-set in config.env.  Supported methods:
+#   devicecode   — browser device flow (recommended; MFA-compatible)
+#   clientsecret — app registration client ID + secret (AZURE_CLIENT_ID / AZURE_CLIENT_SECRET)
+#   refreshtoken — cached token from a prior session (AZUREHOUND_REFRESH_TOKEN)
+#   password     — username/password (blocked when tenant enforces MFA via CAP)
+#
+# Useful env overrides:
+#   FORCE_AZUREHOUND_REFRESH=1      — delete existing output and re-collect
+#   AZUREHOUND_MAX_AGE_HOURS=<N>    — auto-expire and re-collect after N hours
+#   AZUREHOUND_GRAPH_ONLY=true      — suppress the ARM-empty warning when sub
+#                                     access is intentionally out of scope
+#   AZUREHOUND_COLLECTORS=<list>    — e.g. "service-principals" for targeted
+#                                     refresh (default: "all")
+AZH_OUT="${OUT_CLOUD}/azurehound.json"
+AZH_LOG="${OUT_CLOUD}/azurehound.log"
+
+if _step_is_skipped "azurehound"; then
+    log INFO "Skipping: azurehound"
+elif [[ -z "${AZURE_TENANT_ID:-}" ]]; then
+    log WARN "AZURE_TENANT_ID not set — skipping azurehound.  Add it to config.env."
+elif ! command -v "${AZUREHOUND_BIN:-azurehound}" &>/dev/null; then
+    log WARN "azurehound binary not found — run Phase 0 to install, then re-run:"
+    log WARN "  ONLY_STEPS=azurehound bash phases/phase1_discovery.sh"
+else
+    # ── Freshness gates (evaluated before skip_if_exists) ────────────────────
+    if [[ "${FORCE_AZUREHOUND_REFRESH:-false}" == "true" && -f "${AZH_OUT}" ]]; then
+        log INFO "FORCE_AZUREHOUND_REFRESH=true — removing previous output for re-collection"
+        rm -f "${AZH_OUT}" "${AZH_OUT%.*}_summary.json"
+    fi
+    if [[ -f "${AZH_OUT}" && -n "${AZUREHOUND_MAX_AGE_HOURS:-}" ]]; then
+        _azh_age_h=$(python3 -c \
+            "import os,time; print(int((time.time()-os.path.getmtime('${AZH_OUT}'))/3600))" \
+            2>/dev/null || echo 0)
+        if [[ "${_azh_age_h:-0}" -ge "${AZUREHOUND_MAX_AGE_HOURS}" ]]; then
+            log INFO "AzureHound output is ${_azh_age_h}h old (limit: ${AZUREHOUND_MAX_AGE_HOURS}h) — refreshing"
+            rm -f "${AZH_OUT}" "${AZH_OUT%.*}_summary.json"
+        fi
+        unset _azh_age_h
+    fi
+
+    if ! skip_if_exists "${AZH_OUT}" "AzureHound Entra ID gather" "azurehound"; then
+        log INFO "Starting AzureHound Entra ID gather (Microsoft Graph API)..."
+
+        # Select auth method and collect required credentials
+        _azurehound_select_auth
+
+        # Allow operator to target specific collectors for a partial refresh
+        # shellcheck disable=SC2086  # intentional word-split
+        _azh_col=${AZUREHOUND_COLLECTORS:-all}
+
+        _azh_rc=0
+        case "${AZUREHOUND_AUTH_METHOD}" in
+            devicecode)
+                log INFO "AzureHound device code auth: a URL and code will appear below."
+                log INFO "Open the URL in any browser, enter the code, then wait here."
+                "${AZUREHOUND_BIN:-azurehound}" \
+                    -t "${AZURE_TENANT_ID}" \
+                    --device-code \
+                    list ${_azh_col} \
+                    -o "${AZH_OUT}" \
+                    2>&1 | tee "${AZH_LOG}" || _azh_rc=$?
+                ;;
+            clientsecret)
+                log INFO "AzureHound client secret auth (app: ${AZURE_CLIENT_ID})..."
+                "${AZUREHOUND_BIN:-azurehound}" \
+                    -t "${AZURE_TENANT_ID}" \
+                    --client-id     "${AZURE_CLIENT_ID}" \
+                    --client-secret "${AZURE_CLIENT_SECRET}" \
+                    list ${_azh_col} \
+                    -o "${AZH_OUT}" \
+                    2>&1 | tee "${AZH_LOG}" || _azh_rc=$?
+                ;;
+            refreshtoken)
+                log INFO "AzureHound refresh token auth..."
+                "${AZUREHOUND_BIN:-azurehound}" \
+                    -t "${AZURE_TENANT_ID}" \
+                    --refresh-token "${AZUREHOUND_REFRESH_TOKEN}" \
+                    list ${_azh_col} \
+                    -o "${AZH_OUT}" \
+                    2>&1 | tee "${AZH_LOG}" || _azh_rc=$?
+                ;;
+            password)
+                log INFO "AzureHound password auth (${DOMAIN_USER}@${DOMAIN_NAME})..."
+                log WARN "Password mode may fail if the tenant enforces MFA via Conditional Access."
+                "${AZUREHOUND_BIN:-azurehound}" \
+                    -t "${AZURE_TENANT_ID}" \
+                    -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
+                    -p "${DOMAIN_PASS}" \
+                    list ${_azh_col} \
+                    -o "${AZH_OUT}" \
+                    2>&1 | tee "${AZH_LOG}" || _azh_rc=$?
+                ;;
+        esac
+        unset _azh_col
+
+        if [[ "${_azh_rc}" -ne 0 ]]; then
+            log WARN "AzureHound exited with code ${_azh_rc} — output may be partial; validating..."
+        fi
+
+        # Validate output: count per-kind records, detect ARM-empty collection,
+        # scrape log for 403/429/AADSTS/timeout errors
+        _azurehound_validate_output "${AZH_OUT}" "${AZH_LOG}"
+
+        if [[ -s "${AZH_OUT}" ]]; then
+            log INFO "Import into BloodHound CE: Administration → File Ingest → ${AZH_OUT}"
+        fi
+        unset _azh_rc
     fi
 fi
 
-# ─── STEP 1.9 — AZURE RESOURCE INVENTORY (background) ────────────────────────
+# ─── STEP 1.10 — AZURE RESOURCE INVENTORY (background) ───────────────────────
 AZURE_INV="${OUT_CLOUD}/azure_inventory.json"
 if ! skip_if_exists "${AZURE_INV}" "Azure resource inventory" "azure_inventory"; then
     if ! require_az_login; then
@@ -602,7 +756,7 @@ fi
 # immediately after the SMB sweep's `wait_for_bg_jobs` call (see STEP 1.3)
 # so it is not racing the background job.
 
-# ─── STEP 1.10 — CONTROLLED PASSWORD SPRAY (optional) ───────────────────────
+# ─── STEP 1.11 — CONTROLLED PASSWORD SPRAY (optional) ───────────────────────
 # Only runs when SPRAY_ENABLED=true in config.env.
 # SPRAY_MAX_ATTEMPTS MUST be below the domain lockout threshold (verify via Phase 2
 # password policy check first; default guard is 2 attempts, well below typical 5).
@@ -702,6 +856,15 @@ echo -e "${YELLOW}  Background jobs to monitor:${RESET}"
 echo -e "    • Nmap full port scan    → ${FULLSCAN_OUT}.gnmap (merged automatically when done)"
 echo -e "    • BloodHound collection  → ${BH_OUT_DIR}/*.zip"
 echo -e "    • ROADrecon gather       → ${ROAD_DB}"
+if [[ -f "${AZH_OUT%.*}_summary.json" ]]; then
+    _azh_total=$(python3 -c \
+        "import json; d=json.load(open('${AZH_OUT%.*}_summary.json')); print(d.get('total',0))" \
+        2>/dev/null || echo "?")
+    echo -e "    • AzureHound gather      → ${AZH_OUT} (${_azh_total} objects)"
+    unset _azh_total
+else
+    echo -e "    • AzureHound gather      → ${AZH_OUT}"
+fi
 echo -e "    • Azure inventory        → ${AZURE_INV}"
 echo ""
 echo -e "${YELLOW}  Manual steps now required:${RESET}"
