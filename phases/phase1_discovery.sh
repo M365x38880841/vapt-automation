@@ -36,7 +36,7 @@ for _cred_step in smb_sweep ldap_users null_session bloodhound roadrecon passwor
     fi
 done
 if [[ "${_needs_domain_creds}" == "true" ]]; then
-    require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+    prompt_credential "DOMAIN_USER"; prompt_credential "DOMAIN_PASS"
     normalise_domain_user
 fi
 unset _cred_step _needs_domain_creds
@@ -531,10 +531,11 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         # never displayed, making interactive auth impossible.
         log INFO "ROADrecon device code auth: a URL and code will appear below."
         log INFO "Open the URL in any browser, enter the code, then wait here."
-        "${ROADRECON_BIN:-roadrecon}" auth --device-code
+        "${ROADRECON_BIN:-roadrecon}" auth \
+            --device-code \
+            --client-id "${ROADRECON_CLIENT_ID:-04b07795-8542-4c4b-a642-e0b5593ee2f8}"
         "${ROADRECON_BIN:-roadrecon}" gather \
             --database "${ROAD_DB}" \
-            --graph \
             2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
         log OK "ROADrecon gather complete → ${ROAD_DB}"
     else
@@ -546,12 +547,12 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         log INFO "ROADrecon: authenticating (username/password)..."
         "${ROADRECON_BIN:-roadrecon}" auth \
             -u "${DOMAIN_USER}@${DOMAIN_NAME}" \
-            -p "${DOMAIN_PASS}"
+            -p "${DOMAIN_PASS}" \
+            --client-id "${ROADRECON_CLIENT_ID:-04b07795-8542-4c4b-a642-e0b5593ee2f8}"
         bg_run "roadrecon_gather" \
             "${OUT_CLOUD}/roadrecon.log" \
             "${ROADRECON_BIN:-roadrecon}" gather \
-                --database "${ROAD_DB}" \
-                --graph
+                --database "${ROAD_DB}"
         log INFO "ROADrecon running in background. If DB is empty after completion, set ROADRECON_AUTH_METHOD=devicecode."
     fi
 fi
@@ -619,7 +620,7 @@ else
         # Spray needs DOMAIN_USER/PASS to authenticate AND a user list from LDAP.
         # Both are enforced inline so running --only password_spray tells the operator
         # exactly what they still need to collect first.
-        require_var "DOMAIN_USER"; require_var "DOMAIN_PASS"
+        prompt_credential "DOMAIN_USER"; prompt_credential "DOMAIN_PASS"
         require_file "${OUT_AD}/userlist.txt"
 
         MAX_ATTEMPTS="${SPRAY_MAX_ATTEMPTS:-2}"

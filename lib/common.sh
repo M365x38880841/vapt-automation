@@ -56,14 +56,17 @@ for call in re.findall(r'c\.setRPCOptions\(([^)]+)\)', src):
             f'setRPCOptions called with {n_passed} arg(s) but library only accepts {n_accepts}'
         )
 
-# Check 3: bare setIsSCCMPoliciesAttack call exists in script but the method was
-# not yet present in the installed library version.  The lookbehind (?<! and )
-# skips calls already wrapped in the hasattr short-circuit by a prior patch run.
-if re.search(r'(?<! and )c\.setIsSCCMPoliciesAttack\(', src) \
-        and not hasattr(NTLMRelayxConfig, 'setIsSCCMPoliciesAttack'):
-    raise AttributeError(
-        'script has bare setIsSCCMPoliciesAttack call; method absent from NTLMRelayxConfig'
-    )
+# Check 3: any bare c.setXxx( call where the method is absent from NTLMRelayxConfig.
+# Handles ALL version-mismatch setter names (setIsSCCMPoliciesAttack, setIsSCCMDPAttack,
+# etc.) without needing per-method checks.  A call is "bare" if it is not already
+# on a line that contains a hasattr() guard — the guard string is the canonical
+# marker written by Patch 3 below.
+for _method in set(re.findall(r'c\.(set\w+)\(', src)):
+    if not hasattr(NTLMRelayxConfig, _method):
+        if f'hasattr(c, "{_method}")' not in src:
+            raise AttributeError(
+                f'c.{_method}() calls NTLMRelayxConfig method absent from installed library'
+            )
 PYTEST
 }
 
@@ -165,13 +168,11 @@ PYFIX
         log OK "Patched: setRPCOptions call aligned to library signature"
     fi
 
-    # Patch 3 — guard setIsSCCMPoliciesAttack against library version mismatch.
-    # The ntlmrelayx.py script calls c.setIsSCCMPoliciesAttack() in newer versions
-    # of the script, but the method was not present in all impacket library releases.
-    # Replace the bare call with a hasattr short-circuit so older library installs
-    # silently skip the SCCM attack setup rather than crashing at startup.
-    # The (?<! and ) lookbehind ensures idempotency — already-patched lines are skipped.
-    if grep -q 'c\.setIsSCCMPoliciesAttack(' "${_script}"; then
+    # Patch 3 — guard any c.setXxx( call whose method is absent from the installed
+    # NTLMRelayxConfig.  Handles all version-mismatch names in one pass
+    # (setIsSCCMPoliciesAttack, setIsSCCMDPAttack, etc.) without per-method logic.
+    # Lines already containing a hasattr() guard are skipped for idempotency.
+    if grep -q 'c\.set' "${_script}"; then
         sudo python3 - "${_script}" <<'PYFIX3'
 import sys, re
 from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
@@ -179,17 +180,26 @@ from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
 path = sys.argv[1]
 src  = open(path).read()
 
-if re.search(r'(?<! and )c\.setIsSCCMPoliciesAttack\(', src) \
-        and not hasattr(NTLMRelayxConfig, 'setIsSCCMPoliciesAttack'):
-    new_src = src.replace(
-        'c.setIsSCCMPoliciesAttack(',
-        'hasattr(c, "setIsSCCMPoliciesAttack") and c.setIsSCCMPoliciesAttack('
-    )
-    if new_src != src:
-        open(path, 'w').write(new_src)
-        print('Patched setIsSCCMPoliciesAttack → hasattr short-circuit')
+lines   = src.splitlines(keepends=True)
+changed = []
+patched = []
+for line in lines:
+    if 'c.set' in line and 'hasattr(' not in line:
+        for method in re.findall(r'c\.(set\w+)\(', line):
+            if not hasattr(NTLMRelayxConfig, method):
+                line = line.replace(
+                    f'c.{method}(',
+                    f'hasattr(c, "{method}") and c.{method}('
+                )
+                patched.append(method)
+    changed.append(line)
+
+if patched:
+    open(path, 'w').write(''.join(changed))
+    for m in patched:
+        print(f'Patched: c.{m}() → hasattr short-circuit')
 PYFIX3
-        log OK "Patched: setIsSCCMPoliciesAttack guarded against library version mismatch"
+        log OK "Patched: missing NTLMRelayxConfig setter calls guarded with hasattr"
     fi
 }
 
@@ -691,6 +701,29 @@ require_file() {
         log ERROR "Required file not found: ${filepath}"
         exit 1
     }
+}
+
+# prompt_credential VAR_NAME
+# Use when the variable may legitimately be absent from config.env because the
+# operator wants to supply it securely at runtime rather than storing it on disk.
+# If the variable is already set (from config.env or a shell export) it is used
+# as-is — no prompt is shown.  If it is unset or empty, the user is prompted:
+# variables whose name contains PASS or SECRET are read with echo suppressed so
+# the value never appears on screen or in shell history.
+prompt_credential() {
+    local varname="$1"
+    if [[ -n "${!varname:-}" ]]; then return 0; fi
+    if [[ "${varname}" == *PASS* || "${varname}" == *SECRET* || "${varname}" == *pass* ]]; then
+        read -rsp "  [?] Enter ${varname}: " "${varname}"
+        echo
+    else
+        read -rp  "  [?] Enter ${varname}: " "${varname}"
+    fi
+    if [[ -z "${!varname:-}" ]]; then
+        log ERROR "${varname} is required but was not provided — aborting."
+        exit 1
+    fi
+    export "${varname?}"
 }
 
 # ─── OUTPUT DIRECTORY HELPER ──────────────────────────────────────────────────

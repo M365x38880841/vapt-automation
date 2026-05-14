@@ -76,30 +76,30 @@ else
     log WARN "Azure CLI auth failed — scoutsuite and azure_security steps will be skipped"
 fi
 
-# ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background) ─────────────────────────
+# ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (foreground) ─────────────────────────
 # scout azure -c inherits the active az login session and discovers all accessible
 # subscriptions automatically — no --tenant or --subscription flags are needed or
 # accepted by this auth flow.  A single run covers every subscription the
 # authenticated account can see, including multi-subscription tenants.
+#
+# Runs FOREGROUND so that interactive prompts from ScoutSuite reach the operator
+# (e.g. "report directory already exists — overwrite?").  Running in the background
+# would leave those prompts unanswered and silently fail the audit.
+# Use SKIP_STEPS=scoutsuite to skip this step if a prior report is still current.
 SCOUT_REPORT_DIR="${OUT_CLOUD}/scoutsuite"
-SCOUT_DONE="${SCOUT_REPORT_DIR}/report.html"
 mkdir -p "${SCOUT_REPORT_DIR}"
 
 if ! "${_az_ready}" || _step_is_skipped "scoutsuite" quiet; then
     log INFO "Skipping: scoutsuite"
 else
     set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
-    if ! skip_if_exists "${SCOUT_DONE}" "ScoutSuite Azure audit" "scoutsuite"; then
-        if checkpoint "Launch ScoutSuite Azure audit across all subscriptions in the active CLI session?"; then
-            log INFO "Starting ScoutSuite Azure audit in background — covers all subscriptions visible to the active session (est. 25–60 min)..."
-            bg_run "scoutsuite" \
-                "${OUT_CLOUD}/scoutsuite.log" \
-                "${SCOUT_CMD_ARRAY[@]}" azure \
-                    -c \
-                    --report-dir "${SCOUT_REPORT_DIR}" \
-                    --no-browser
-            log INFO "ScoutSuite PID: ${BG_JOB_PIDS[-1]}"
-        fi
+    if checkpoint "Launch ScoutSuite Azure audit across all subscriptions in the active CLI session? (foreground — est. 25–60 min)"; then
+        log INFO "Starting ScoutSuite Azure audit — covers all subscriptions visible to the active session..."
+        "${SCOUT_CMD_ARRAY[@]}" azure \
+            -c \
+            --report-dir "${SCOUT_REPORT_DIR}" \
+            --no-browser
+        log OK "ScoutSuite Azure audit complete → ${SCOUT_REPORT_DIR}"
     fi
 fi  # end scoutsuite guard
 
