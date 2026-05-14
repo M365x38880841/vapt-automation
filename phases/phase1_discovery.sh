@@ -534,6 +534,7 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         "${ROADRECON_BIN:-roadrecon}" auth --device-code
         "${ROADRECON_BIN:-roadrecon}" gather \
             --database "${ROAD_DB}" \
+            --graph \
             2>&1 | tee "${OUT_CLOUD}/roadrecon.log"
         log OK "ROADrecon gather complete → ${ROAD_DB}"
     else
@@ -549,7 +550,8 @@ if ! skip_if_exists "${ROAD_DB}" "ROADrecon gather" "roadrecon"; then
         bg_run "roadrecon_gather" \
             "${OUT_CLOUD}/roadrecon.log" \
             "${ROADRECON_BIN:-roadrecon}" gather \
-                --database "${ROAD_DB}"
+                --database "${ROAD_DB}" \
+                --graph
         log INFO "ROADrecon running in background. If DB is empty after completion, set ROADRECON_AUTH_METHOD=devicecode."
     fi
 fi

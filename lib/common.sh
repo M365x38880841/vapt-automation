@@ -55,6 +55,15 @@ for call in re.findall(r'c\.setRPCOptions\(([^)]+)\)', src):
         raise TypeError(
             f'setRPCOptions called with {n_passed} arg(s) but library only accepts {n_accepts}'
         )
+
+# Check 3: bare setIsSCCMPoliciesAttack call exists in script but the method was
+# not yet present in the installed library version.  The lookbehind (?<! and )
+# skips calls already wrapped in the hasattr short-circuit by a prior patch run.
+if re.search(r'(?<! and )c\.setIsSCCMPoliciesAttack\(', src) \
+        and not hasattr(NTLMRelayxConfig, 'setIsSCCMPoliciesAttack'):
+    raise AttributeError(
+        'script has bare setIsSCCMPoliciesAttack call; method absent from NTLMRelayxConfig'
+    )
 PYTEST
 }
 
@@ -154,6 +163,33 @@ if new_src != src:
     print(f'Patched setRPCOptions → {n_accepts} arg(s)')
 PYFIX
         log OK "Patched: setRPCOptions call aligned to library signature"
+    fi
+
+    # Patch 3 — guard setIsSCCMPoliciesAttack against library version mismatch.
+    # The ntlmrelayx.py script calls c.setIsSCCMPoliciesAttack() in newer versions
+    # of the script, but the method was not present in all impacket library releases.
+    # Replace the bare call with a hasattr short-circuit so older library installs
+    # silently skip the SCCM attack setup rather than crashing at startup.
+    # The (?<! and ) lookbehind ensures idempotency — already-patched lines are skipped.
+    if grep -q 'c\.setIsSCCMPoliciesAttack(' "${_script}"; then
+        sudo python3 - "${_script}" <<'PYFIX3'
+import sys, re
+from impacket.examples.ntlmrelayx.utils.config import NTLMRelayxConfig
+
+path = sys.argv[1]
+src  = open(path).read()
+
+if re.search(r'(?<! and )c\.setIsSCCMPoliciesAttack\(', src) \
+        and not hasattr(NTLMRelayxConfig, 'setIsSCCMPoliciesAttack'):
+    new_src = src.replace(
+        'c.setIsSCCMPoliciesAttack(',
+        'hasattr(c, "setIsSCCMPoliciesAttack") and c.setIsSCCMPoliciesAttack('
+    )
+    if new_src != src:
+        open(path, 'w').write(new_src)
+        print('Patched setIsSCCMPoliciesAttack → hasattr short-circuit')
+PYFIX3
+        log OK "Patched: setIsSCCMPoliciesAttack guarded against library version mismatch"
     fi
 }
 

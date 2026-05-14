@@ -76,39 +76,32 @@ else
     log WARN "Azure CLI auth failed — scoutsuite and azure_security steps will be skipped"
 fi
 
-# ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background — one job per subscription) ─
-# Runs against ALL subscriptions, not just the first one.
+# ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (background) ─────────────────────────
+# scout azure -c inherits the active az login session and discovers all accessible
+# subscriptions automatically — no --tenant or --subscription flags are needed or
+# accepted by this auth flow.  A single run covers every subscription the
+# authenticated account can see, including multi-subscription tenants.
 SCOUT_REPORT_DIR="${OUT_CLOUD}/scoutsuite"
+SCOUT_DONE="${SCOUT_REPORT_DIR}/report.html"
 mkdir -p "${SCOUT_REPORT_DIR}"
 
-# Skip the entire scoutsuite block if scoutsuite is excluded OR if no
-# subscription IDs are configured — `for x in ${UNSET}` aborts under `set -u`.
 if ! "${_az_ready}" || _step_is_skipped "scoutsuite" quiet; then
     log INFO "Skipping: scoutsuite"
-elif [[ -z "${AZURE_SUBSCRIPTION_IDS:-}" ]]; then
-    log WARN "AZURE_SUBSCRIPTION_IDS not set — scoutsuite skipped."
 else
-set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
-for sub_id in ${AZURE_SUBSCRIPTION_IDS}; do
-    SCOUT_REPORT_SUB="${SCOUT_REPORT_DIR}/${sub_id}"
-    SCOUT_DONE_SUB="${SCOUT_REPORT_SUB}/report.html"
-    mkdir -p "${SCOUT_REPORT_SUB}"
-    if ! skip_if_exists "${SCOUT_DONE_SUB}" "ScoutSuite audit for subscription ${sub_id}" "scoutsuite"; then
-        if checkpoint "Launch ScoutSuite audit against subscription ${sub_id} (tenant: ${AZURE_TENANT_ID})?"; then
-            log INFO "Starting ScoutSuite for ${sub_id} in background (est. 25–45 min)..."
-            bg_run "scoutsuite_${sub_id}" \
-                "${OUT_CLOUD}/scoutsuite_${sub_id}.log" \
+    set_scout_cmd  # resolves SCOUT_CMD_ARRAY=( scout suite ) or ( python3 -m ScoutSuite )
+    if ! skip_if_exists "${SCOUT_DONE}" "ScoutSuite Azure audit" "scoutsuite"; then
+        if checkpoint "Launch ScoutSuite Azure audit across all subscriptions in the active CLI session?"; then
+            log INFO "Starting ScoutSuite Azure audit in background — covers all subscriptions visible to the active session (est. 25–60 min)..."
+            bg_run "scoutsuite" \
+                "${OUT_CLOUD}/scoutsuite.log" \
                 "${SCOUT_CMD_ARRAY[@]}" azure \
                     -c \
-                    --tenant "${AZURE_TENANT_ID}" \
-                    --subscription-id "${sub_id}" \
-                    --report-dir "${SCOUT_REPORT_SUB}" \
+                    --report-dir "${SCOUT_REPORT_DIR}" \
                     --no-browser
-            log INFO "ScoutSuite (${sub_id}) PID: ${BG_JOB_PIDS[-1]}"
+            log INFO "ScoutSuite PID: ${BG_JOB_PIDS[-1]}"
         fi
     fi
-done
-fi  # end scoutsuite + AZURE_SUBSCRIPTION_IDS guard
+fi  # end scoutsuite guard
 
 # ─── STEP 2.2 — AZURE SECURITY CHECKS (background — parallel set) ────────────
 AZ_SEC="${OUT_CLOUD}/security_checks"
