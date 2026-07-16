@@ -357,6 +357,30 @@ detect_cme() {
     export CME_BIN
 }
 
+# ─── CONFIG BOOTSTRAP (standalone phase re-invocation) ────────────────────────
+# orchestrator.py's run_phase() loads config.env and injects it into each phase's
+# subprocess env, so under the orchestrator OUTPUT_BASE_DIR (and friends) are
+# already present. But operators are told to re-run a phase script DIRECTLY
+# (e.g. Phase 3 prints  "Re-run: OBTAINED_HASH=<hash> bash phases/phase3_exploit.sh").
+# In that path nothing sources config.env, so require_var aborts with e.g.
+# "Required config variable not set: DOMAIN_NAME" even though config.env exists.
+# Fix: if OUTPUT_BASE_DIR is not already in the env (i.e. no orchestrator env was
+# injected), fall back to sourcing config.env from the repo root. `set -a` mirrors
+# run_phase()'s behaviour of exporting the vars so child tools/subprocesses see
+# them too, and plain `source` naturally expands ${HOME}/$VAR just like the Python
+# loader does. If config.env genuinely does not exist we do NOT error here — the
+# existing require_var checks below still fire and give the canonical message.
+if [[ -z "${OUTPUT_BASE_DIR:-}" ]]; then
+    _common_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    if [[ -f "${_common_repo_root}/config.env" ]]; then
+        set -a
+        # shellcheck disable=SC1091  # runtime-resolved operator config, not in repo
+        source "${_common_repo_root}/config.env"
+        set +a
+    fi
+    unset _common_repo_root
+fi
+
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 LOG_FILE="${OUTPUT_BASE_DIR:-$HOME/vapt}/engagement_log.md"
 # Ensure the log directory exists once at source time so the first `log` call

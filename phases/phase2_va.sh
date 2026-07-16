@@ -76,6 +76,25 @@ else
     log WARN "Azure CLI auth failed — scoutsuite and azure_security steps will be skipped"
 fi
 
+# ─── AZURE TOKEN FRESHNESS PRE-FLIGHT ────────────────────────────────────────
+# require_az_login only runs `az account show`, which reads the CACHED account
+# profile and succeeds even when the underlying refresh token has been revoked
+# (Azure surfaces AADSTS50173 only when a *real* token is requested — e.g. after
+# a password reset). During the 2026-07-15 retest this masked a dead session:
+# ScoutSuite aborted (its report dir was never created) and the az checks
+# appended AADSTS/AuthorizationFailed errors into the findings files, which then
+# read as false "clean" results. Force a real token acquisition here so a revoked
+# session is caught up front and the dependent steps are skipped with a clear
+# ERROR instead of producing misleading empty output.
+if "${_az_ready}"; then
+    if ! az account get-access-token --output none 2>/dev/null; then
+        log ERROR "Azure access-token acquisition failed — the cached CLI session is stale or revoked."
+        log ERROR "Re-authenticate before re-running cloud steps:  az login --use-device-code${AZURE_TENANT_ID:+ --tenant ${AZURE_TENANT_ID}}"
+        log ERROR "Skipping ScoutSuite and Azure security checks to avoid recording false 'clean' results."
+        _az_ready=false
+    fi
+fi
+
 # ─── STEP 2.1 — SCOUTSUITE AZURE AUDIT (foreground) ─────────────────────────
 # scout azure -c inherits the active az login session and discovers all accessible
 # subscriptions automatically — no --tenant or --subscription flags are needed or
@@ -124,6 +143,24 @@ if "${_az_ready}" && ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted secu
         bash -c "
             set -euo pipefail
 
+            # az_check <outfile> <az cmd...> — run one az query and record the
+            # result so a real API error can never be recorded as '0 findings'.
+            # On success the finding rows are appended to <outfile>; on failure the
+            # az error text (403 / AADSTS / AuthorizationFailed) is written as an
+            # explicit CHECK FAILED marker instead of being silently swallowed by
+            # '2>&1 >> file' — the root cause of Bug 2, where an errored check left
+            # a findings file that Phase 5 consolidation then read as clean/empty.
+            az_check() {
+                local _outfile=\"\$1\"; shift
+                local _out _rc=0
+                _out=\"\$(\"\$@\" 2>&1)\" || _rc=\$?
+                if [[ \"\${_rc}\" -eq 0 ]]; then
+                    printf '%s\\n' \"\${_out}\" >> \"\${_outfile}\"
+                else
+                    printf 'CHECK FAILED (az exit %s): %s\\n' \"\${_rc}\" \"\${_out}\" >> \"\${_outfile}\"
+                fi
+            }
+
             # Initialise output files before the loop so each subscription appends
             > '${AZ_SEC}/public_blob_access.txt'
             > '${AZ_SEC}/nsg_any_inbound.txt'
@@ -138,13 +175,21 @@ if "${_az_ready}" && ! skip_if_exists "${AZ_SEC}/done.flag" "Azure targeted secu
                 echo \"--- Subscription: \${sub} ---\"
 
                 echo \"=== PUBLIC BLOB ACCESS [\${sub}] ===\" >> '${AZ_SEC}/public_blob_access.txt'
-                az storage account list \
+                az_check '${AZ_SEC}/public_blob_access.txt' \
+                    az storage account list \
                     --query '[?allowBlobPublicAccess==\`true\`].{Name:name,RG:resourceGroup,Region:location}' \
-                    --output table 2>&1 >> '${AZ_SEC}/public_blob_access.txt'
+                    --output table
 
                 echo \"=== NSG ALLOW ANY INBOUND [\${sub}] ===\" >> '${AZ_SEC}/nsg_any_inbound.txt'
-                az network nsg list --output json 2>/dev/null | \
-                    python3 -c \"
+                # Capture az exit status explicitly rather than piping through
+                # '2>/dev/null' — a suppressed API error would otherwise feed the
+                # python filter empty input and record a false 'no NSGs' result.
+                _nsg_rc=0
+                _nsg_json=\"\$(az network nsg list --output json 2>&1)\" || _nsg_rc=\$?
+                if [[ \"\${_nsg_rc}\" -ne 0 ]]; then
+                    printf 'CHECK FAILED (az network nsg list, exit %s): %s\\n' \"\${_nsg_rc}\" \"\${_nsg_json}\" >> '${AZ_SEC}/nsg_any_inbound.txt'
+                else
+                    printf '%s' \"\${_nsg_json}\" | python3 -c \"
 import json, sys
 nsgs = json.load(sys.stdin)
 for nsg in nsgs:
@@ -154,27 +199,41 @@ for nsg in nsgs:
             rule.get('sourceAddressPrefix') in ['*', 'Internet', '0.0.0.0/0']):
             print(f\\\"NSG: {nsg['name']} | Port: {rule.get('destinationPortRange')} | Priority: {rule.get('priority')}\\\")
 \" >> '${AZ_SEC}/nsg_any_inbound.txt' 2>&1
+                fi
 
                 echo \"=== KEY VAULT ACCESS POLICIES [\${sub}] ===\" >> '${AZ_SEC}/keyvault_policies.txt'
-                az keyvault list --query '[].name' --output tsv 2>/dev/null | while read kv; do
-                    echo \"--- \${kv} ---\"
-                    az keyvault show -n \"\${kv}\" \
-                        --query 'properties.accessPolicies[].{ObjectId:objectId,Keys:permissions.keys,Secrets:permissions.secrets}' \
-                        --output table 2>&1
-                done >> '${AZ_SEC}/keyvault_policies.txt'
+                # As above: capture the list call's exit status so a revoked-token
+                # / AuthorizationFailed error becomes a CHECK FAILED marker rather
+                # than a silently-empty (falsely 'clean') key vault inventory.
+                _kv_rc=0
+                _kv_list=\"\$(az keyvault list --query '[].name' --output tsv 2>&1)\" || _kv_rc=\$?
+                if [[ \"\${_kv_rc}\" -ne 0 ]]; then
+                    printf 'CHECK FAILED (az keyvault list, exit %s): %s\\n' \"\${_kv_rc}\" \"\${_kv_list}\" >> '${AZ_SEC}/keyvault_policies.txt'
+                else
+                    printf '%s\\n' \"\${_kv_list}\" | while read kv; do
+                        [[ -z \"\${kv}\" ]] && continue
+                        echo \"--- \${kv} ---\"
+                        az keyvault show -n \"\${kv}\" \
+                            --query 'properties.accessPolicies[].{ObjectId:objectId,Keys:permissions.keys,Secrets:permissions.secrets}' \
+                            --output table 2>&1
+                    done >> '${AZ_SEC}/keyvault_policies.txt'
+                fi
 
                 echo \"=== PUBLIC IP VMs [\${sub}] ===\" >> '${AZ_SEC}/public_ips_vms.txt'
-                az vm list-ip-addresses --output table 2>&1 >> '${AZ_SEC}/public_ips_vms.txt'
+                az_check '${AZ_SEC}/public_ips_vms.txt' \
+                    az vm list-ip-addresses --output table
 
                 echo \"=== OVER-PRIVILEGED ROLE ASSIGNMENTS [\${sub}] ===\" >> '${AZ_SEC}/risky_roles.txt'
-                az role assignment list --all \
+                az_check '${AZ_SEC}/risky_roles.txt' \
+                    az role assignment list --all \
                     --query '[?roleDefinitionName==\`Owner\` || roleDefinitionName==\`Contributor\`].{Principal:principalName,Role:roleDefinitionName,Scope:scope}' \
-                    --output table 2>&1 >> '${AZ_SEC}/risky_roles.txt'
+                    --output table
 
                 echo \"=== STORAGE ACCOUNTS WITHOUT HTTPS ONLY [\${sub}] ===\" >> '${AZ_SEC}/storage_no_https.txt'
-                az storage account list \
+                az_check '${AZ_SEC}/storage_no_https.txt' \
+                    az storage account list \
                     --query '[?supportsHttpsTrafficOnly==\`false\`].{Name:name,RG:resourceGroup}' \
-                    --output table 2>&1 >> '${AZ_SEC}/storage_no_https.txt'
+                    --output table
 
                 echo \"=== DIAGNOSTIC SETTINGS [\${sub}] ===\" >> '${AZ_SEC}/diagnostics.txt'
                 az monitor diagnostic-settings subscription list \
@@ -260,7 +319,7 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
     "${CME_BIN}" smb "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --pass-pol \
-        2>&1 > "${AD_CHECKS}/password_policy.txt" || true
+        > "${AD_CHECKS}/password_policy.txt" 2>&1 || true
     log OK "Password policy extracted → ${AD_CHECKS}/password_policy.txt"
 
     # Enumerate shares
@@ -271,13 +330,25 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         > "${AD_CHECKS}/shares.txt" 2>&1 || true
     log OK "Share enumeration complete → ${AD_CHECKS}/shares.txt"
 
-    # Check for accounts with no pre-auth (AS-REP using CME)
+    # Enumerate privileged group membership.
+    # NetExec moved --groups from the smb module to ldap ("Arg moved to the
+    # ldap protocol") — smb here silently no-ops with "[REMOVED]" instead of
+    # returning membership, which is why this must run as an ldap check.
     log INFO "Checking admin group members..."
-    "${CME_BIN}" smb "${PRIMARY_DC}" \
+    "${CME_BIN}" ldap "${PRIMARY_DC}" \
         -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
         --groups "Domain Admins" \
         > "${AD_CHECKS}/domain_admins.txt" 2>&1 || true
     log OK "Domain Admins group members → ${AD_CHECKS}/domain_admins.txt"
+
+    # Backup Operators is the group the original engagement flagged (F026:
+    # sccmsvc, Veritasvc, beadmin, HNSAdmin, Administrator) — re-check it
+    # explicitly rather than relying on Domain Admins alone to catch drift.
+    "${CME_BIN}" ldap "${PRIMARY_DC}" \
+        -u "${DOMAIN_USER}" -p "${DOMAIN_PASS}" -d "${DOMAIN_NAME}" \
+        --groups "Backup Operators" \
+        > "${AD_CHECKS}/backup_operators.txt" 2>&1 || true
+    log OK "Backup Operators group members → ${AD_CHECKS}/backup_operators.txt"
 
     # Unconstrained delegation check via LDAP
     log INFO "Checking for unconstrained delegation..."
@@ -287,7 +358,7 @@ if ! skip_if_exists "${AD_CHECKS}/done.flag" "Linux-based AD security checks" "a
         -b "$(echo "DC=${DOMAIN_NAME}" | sed 's/\./,DC=/g')" \
         '(&(objectCategory=computer)(userAccountControl:1.2.840.113556.1.4.803:=524288))' \
         sAMAccountName dNSHostName \
-        2>&1 > "${AD_CHECKS}/unconstrained_delegation.txt" || true
+        > "${AD_CHECKS}/unconstrained_delegation.txt" 2>&1 || true
     UNCON_COUNT=$(grep -c 'sAMAccountName:' "${AD_CHECKS}/unconstrained_delegation.txt" 2>/dev/null || true)
     UNCON_COUNT="${UNCON_COUNT//[^0-9]/}"
     UNCON_COUNT="${UNCON_COUNT:-0}"

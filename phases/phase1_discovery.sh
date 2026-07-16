@@ -647,9 +647,16 @@ else
         # Select auth method and collect required credentials
         _azurehound_select_auth
 
-        # Allow operator to target specific collectors for a partial refresh
-        # shellcheck disable=SC2086  # intentional word-split
-        _azh_col=${AZUREHOUND_COLLECTORS:-all}
+        # Allow operator to target specific collectors for a partial refresh.
+        # Sentinel-default changed: this used to default to the literal string
+        # "all" and pass it positionally to `azurehound list`, but current
+        # SpecterOps azurehound has no "all" collector — cobra rejects it with
+        # `unknown command "all"` and collects nothing. Bare `azurehound list`
+        # already collects everything, so when no collectors are set we pass NO
+        # positional arg; real collector names (if the operator sets them) still
+        # pass through positionally via the unquoted expansion below.
+        # shellcheck disable=SC2086  # intentional word-split when collectors are set
+        _azh_col="${AZUREHOUND_COLLECTORS:-}"
 
         _azh_rc=0
         case "${AZUREHOUND_AUTH_METHOD}" in

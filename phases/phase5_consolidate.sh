@@ -90,6 +90,18 @@ SMB_VULN_HITS=$(grep -ci 'vulnerable' "${OUTPUT_BASE_DIR}/phase2/network/smb_vul
 SMB_VULN_HITS="${SMB_VULN_HITS//[^0-9]/}"
 SMB_VULN_HITS="${SMB_VULN_HITS:-0}"
 
+# Azure cloud checks that errored (revoked token / RBAC denial / etc.) instead of
+# genuinely returning zero results — see phase2_va.sh's az_check helper. Counted
+# separately so a "0" in the table above never gets read as "clean" when the
+# check actually never ran.
+CHECK_FAILED_COUNT=$(grep -c 'CHECK FAILED' "${OUTPUT_BASE_DIR}/phase2/cloud/security_checks/"*.txt 2>/dev/null \
+    | awk -F: '{s+=$NF} END{print s+0}')
+CHECK_FAILED_COUNT="${CHECK_FAILED_COUNT//[^0-9]/}"
+CHECK_FAILED_COUNT="${CHECK_FAILED_COUNT:-0}"
+if [[ "${CHECK_FAILED_COUNT}" -gt 0 ]]; then
+    log WARN "${CHECK_FAILED_COUNT} Azure security check(s) failed to run (stale token / RBAC) — see phase2/cloud/security_checks/*.txt for CHECK FAILED markers. Do not read the indicator table below as clean for those categories."
+fi
+
 # Copy AD CS and SMB vuln evidence
 cp -u "${OUTPUT_BASE_DIR}/phase2/ad/ad_checks/adcs/"* "${EVIDENCE_DIR}/ad/" 2>/dev/null && log OK "AD CS certipy output copied" || true
 cp -u "${OUTPUT_BASE_DIR}/phase2/network/smb_vuln_checks.txt" "${EVIDENCE_DIR}/network/" 2>/dev/null || true
@@ -139,6 +151,17 @@ cat > "${SCAFFOLD}" <<SCAFFOLD_EOF
 | SMB vulnerability hits | ${SMB_VULN_HITS} | evidence/network/smb_vuln_checks.txt |
 | Web targets DAST-scanned | ${ZAP_TARGET_COUNT} | evidence/web/zap/<target>/zap_report.html |
 | ZAP total alert count | ${ZAP_ALERT_COUNT} | evidence/web/zap/<target>/zap_report.json |
+| Azure checks that FAILED to run (unverified, not clean) | ${CHECK_FAILED_COUNT} | phase2/cloud/security_checks/*.txt (grep "CHECK FAILED") |
+
+$(if [[ "${CHECK_FAILED_COUNT}" -gt 0 ]]; then cat <<WARN_EOF
+> **⚠ ${CHECK_FAILED_COUNT} Azure security check(s) above did not complete** (stale/revoked token,
+> RBAC denial, or similar API error — see the \`CHECK FAILED\` markers in the
+> referenced files). Any category above showing 0 that overlaps with a failed
+> check is **unverified this cycle, not confirmed clean** — re-run after
+> resolving the underlying Azure CLI auth/permission issue before treating it
+> as a closed finding.
+WARN_EOF
+fi)
 
 ---
 
